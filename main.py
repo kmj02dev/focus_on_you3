@@ -73,7 +73,6 @@ DEFAULT_SETTINGS = {
     "sweep_thresholds": "0.35,0.50,0.65",
     "blur_kernel": 35,
     "frame_stride": 1,
-    "fps_cap": 15,
     "benchmark_frames": 0,
 }
 
@@ -86,7 +85,6 @@ class RuntimeSettings:
     infer_scale: float = 0.5
     blur_kernel: int = 35
     frame_stride: int = 1
-    fps_cap: int = 15
 
 
 @dataclass
@@ -322,7 +320,6 @@ class VideoWorker(QThread):
         self.video_info.emit(total_frames, float(source_fps))
 
         while self.running:
-            loop_started = time.perf_counter()
             with self.control_lock:
                 paused = self.paused
                 requested_seek = self.seek_frame
@@ -380,13 +377,6 @@ class VideoWorker(QThread):
                 skipped += 1
 
             frame_index += 1
-            if paused:
-                continue
-            fps_cap = max(1, settings.fps_cap)
-            target_dt = 1.0 / fps_cap
-            spent = time.perf_counter() - loop_started
-            if spent < target_dt:
-                time.sleep(target_dt - spent)
 
         cap.release()
         self.status.emit("stopped")
@@ -726,13 +716,9 @@ class MainWindow(QMainWindow):
         self.frame_stride = QSpinBox()
         self.frame_stride.setRange(1, 30)
         self.frame_stride.setValue(DEFAULT_SETTINGS["frame_stride"])
-        self.fps_cap = QSpinBox()
-        self.fps_cap.setRange(1, 60)
-        self.fps_cap.setValue(DEFAULT_SETTINGS["fps_cap"])
         self.reset_hyperparams_button = QPushButton("Reset Hyperparameters")
         realtime_form.addRow("Inference scale", self.infer_scale)
         realtime_form.addRow("Process every N frames", self.frame_stride)
-        realtime_form.addRow("Target FPS cap", self.fps_cap)
         realtime_form.addRow(self.reset_hyperparams_button)
         controls.addWidget(realtime_box)
 
@@ -814,7 +800,6 @@ class MainWindow(QMainWindow):
             self.mode,
             self.infer_scale,
             self.frame_stride,
-            self.fps_cap,
             self.blur_kernel,
         ]:
             if isinstance(widget, QLineEdit):
@@ -849,7 +834,6 @@ class MainWindow(QMainWindow):
             infer_scale=float(self.infer_scale.currentText()),
             blur_kernel=self.blur_kernel.value(),
             frame_stride=self.frame_stride.value(),
-            fps_cap=self.fps_cap.value(),
         )
 
     def current_sweep_config(self) -> SweepConfig:
@@ -881,7 +865,6 @@ class MainWindow(QMainWindow):
         self.sweep_thresholds.setText(DEFAULT_SETTINGS["sweep_thresholds"])
         self.blur_kernel.setValue(DEFAULT_SETTINGS["blur_kernel"])
         self.frame_stride.setValue(DEFAULT_SETTINGS["frame_stride"])
-        self.fps_cap.setValue(DEFAULT_SETTINGS["fps_cap"])
         self.benchmark_frames.setValue(DEFAULT_SETTINGS["benchmark_frames"])
         self.update_sweep_estimate()
         self.push_settings()

@@ -60,6 +60,8 @@ The main resolution hyperparameter is `scale`, not absolute width. `scale` contr
 
 Lower `scale` usually improves FPS and latency, but can increase `non_target_leakage` or `target_damage`. Higher `scale` usually improves mask quality, but costs more latency.
 
+`Process every N frames` controls how often inference runs during live camera/video playback. Larger values skip more frames between model calls. It should improve throughput, but per-call `model_latency_ms` can still vary because the GPU may idle, clocks may change, and UI/video decode work continues between inference calls.
+
 The sweep space is editable in the UI as comma-separated values:
 
 - `Scales CSV`: default `0.25,0.50,0.75,1.00`
