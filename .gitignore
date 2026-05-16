@@ -15,3 +15,7 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# md
+*.md
+!README.md
