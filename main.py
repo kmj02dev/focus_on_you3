@@ -70,7 +70,7 @@ class RuntimeSettings:
     prompt: str = "road"
     mode: str = "blur"
     threshold: float = 0.5
-    infer_width: int = 192
+    infer_scale: float = 0.5
     blur_kernel: int = 35
     frame_stride: int = 1
     fps_cap: int = 15
@@ -84,7 +84,7 @@ class FrameMetrics:
     mask_coverage: float
     processed_frames: int
     skipped_frames: int
-    infer_width: int
+    infer_scale: float
 
 
 def default_device() -> str:
@@ -177,14 +177,14 @@ class PromptSegmenter:
             self.device = torch.device(device)
 
     @torch.inference_mode()
-    def predict_mask(self, frame: np.ndarray, prompt: str, infer_width: int) -> tuple[np.ndarray, float]:
+    def predict_mask(self, frame: np.ndarray, prompt: str, infer_scale: float) -> tuple[np.ndarray, float]:
         self.load()
         assert self.processor is not None
         assert self.model is not None
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         height, width = rgb.shape[:2]
-        scale = min(1.0, infer_width / max(1, width))
+        scale = min(1.0, max(0.05, infer_scale))
         if scale < 1.0:
             resized = cv2.resize(rgb, (round(width * scale), round(height * scale)), interpolation=cv2.INTER_AREA)
         else:
@@ -313,7 +313,7 @@ class VideoWorker(QThread):
                     mask, model_latency_ms = self.segmenter.predict_mask(
                         frame,
                         settings.prompt.strip(),
-                        settings.infer_width,
+                        settings.infer_scale,
                     )
                     output = apply_effect(frame, mask, settings.threshold, settings.mode, settings.blur_kernel)
                     processed += 1
@@ -330,7 +330,7 @@ class VideoWorker(QThread):
                             mask_coverage=float((mask >= settings.threshold).mean()),
                             processed_frames=processed,
                             skipped_frames=skipped,
-                            infer_width=settings.infer_width,
+                            infer_scale=settings.infer_scale,
                         )
                     )
                 except Exception as exc:
@@ -364,19 +364,19 @@ class SweepWorker(QThread):
     def run(self) -> None:
         try:
             results = []
-            for infer_width in [128, 192, 256, 320]:
+            for infer_scale in [0.25, 0.50, 0.75, 1.00]:
                 for threshold in [0.35, 0.50, 0.65]:
                     started = time.perf_counter()
                     mask, model_latency_ms = self.segmenter.predict_mask(
                         self.frame,
                         self.settings.prompt,
-                        infer_width,
+                        infer_scale,
                     )
                     _ = apply_effect(self.frame, mask, threshold, self.settings.mode, self.settings.blur_kernel)
                     total_ms = (time.perf_counter() - started) * 1000.0
                     results.append(
                         {
-                            "infer_width": infer_width,
+                            "infer_scale": infer_scale,
                             "threshold": threshold,
                             "latency_ms": total_ms,
                             "model_latency_ms": model_latency_ms,
@@ -429,13 +429,13 @@ class BenchmarkWorker(QThread):
                 raise RuntimeError("No benchmark frames with GT masks found")
 
             results = []
-            combinations = [(width, threshold) for width in [128, 192, 256] for threshold in [0.35, 0.50, 0.65]]
+            combinations = [(scale, threshold) for scale in [0.25, 0.50, 0.75, 1.00] for threshold in [0.35, 0.50, 0.65]]
             total_combinations = len(combinations)
-            for combo_index, (infer_width, threshold) in enumerate(combinations, start=1):
+            for combo_index, (infer_scale, threshold) in enumerate(combinations, start=1):
                 self.progress.emit(
                     combo_index,
                     total_combinations,
-                    f"width={infer_width}, threshold={threshold:.2f}",
+                    f"scale={infer_scale:.2f}, threshold={threshold:.2f}",
                 )
                 tp_total = fp_total = tn_total = fn_total = 0
                 latencies = []
@@ -444,7 +444,7 @@ class BenchmarkWorker(QThread):
                     mask, model_latency_ms = self.segmenter.predict_mask(
                         frame,
                         self.settings.prompt,
-                        infer_width,
+                        infer_scale,
                     )
                     output = apply_effect(frame, mask, threshold, self.settings.mode, self.settings.blur_kernel)
                     self.preview.emit(bgr_to_qimage(frame), bgr_to_qimage(output))
@@ -457,7 +457,7 @@ class BenchmarkWorker(QThread):
                 elapsed = time.perf_counter() - started
                 leakage, damage = metric_rates(tp_total, fp_total, tn_total, fn_total)
                 row = {
-                    "infer_width": infer_width,
+                    "infer_scale": infer_scale,
                     "threshold": threshold,
                     "non_target_leakage": leakage,
                     "target_damage": damage,
@@ -661,16 +661,16 @@ class MainWindow(QMainWindow):
 
         realtime_box = QGroupBox("Realtime Controls")
         realtime_form = QFormLayout(realtime_box)
-        self.infer_width = QComboBox()
-        self.infer_width.addItems(["128", "192", "256", "320", "480"])
-        self.infer_width.setCurrentText("192")
+        self.infer_scale = QComboBox()
+        self.infer_scale.addItems(["0.25", "0.50", "0.75", "1.00"])
+        self.infer_scale.setCurrentText("0.50")
         self.frame_stride = QSpinBox()
         self.frame_stride.setRange(1, 30)
         self.frame_stride.setValue(1)
         self.fps_cap = QSpinBox()
         self.fps_cap.setRange(1, 60)
         self.fps_cap.setValue(15)
-        realtime_form.addRow("Inference width", self.infer_width)
+        realtime_form.addRow("Inference scale", self.infer_scale)
         realtime_form.addRow("Process every N frames", self.frame_stride)
         realtime_form.addRow("Target FPS cap", self.fps_cap)
         controls.addWidget(realtime_box)
@@ -679,7 +679,7 @@ class MainWindow(QMainWindow):
         sweep_layout = QVBoxLayout(sweep_box)
         self.sweep_button = QPushButton("Run Sweep On Current Frame")
         self.sweep_table = QTableWidget(0, 4)
-        self.sweep_table.setHorizontalHeaderLabels(["width", "thr", "lat ms", "coverage"])
+        self.sweep_table.setHorizontalHeaderLabels(["scale", "thr", "lat ms", "coverage"])
         self.sweep_table.setMinimumHeight(120)
         self.sweep_table.setMaximumHeight(170)
         sweep_layout.addWidget(self.sweep_button)
@@ -694,12 +694,12 @@ class MainWindow(QMainWindow):
         self.benchmark_frames.setSpecialValueText("All")
         self.benchmark_button = QPushButton("Run CamVid Road Benchmark")
         self.benchmark_progress = QProgressBar()
-        self.benchmark_progress.setRange(0, 9)
+        self.benchmark_progress.setRange(0, 12)
         self.benchmark_progress.setValue(0)
         self.benchmark_progress.setTextVisible(True)
         self.benchmark_progress_label = QLabel("idle")
         self.benchmark_table = QTableWidget(0, 6)
-        self.benchmark_table.setHorizontalHeaderLabels(["width", "thr", "leak", "damage", "FPS", "lat ms"])
+        self.benchmark_table.setHorizontalHeaderLabels(["scale", "thr", "leak", "damage", "FPS", "lat ms"])
         self.benchmark_table.setMinimumHeight(150)
         self.benchmark_table.setMaximumHeight(210)
         benchmark_form = QFormLayout()
@@ -735,7 +735,7 @@ class MainWindow(QMainWindow):
         for widget in [
             self.prompt,
             self.mode,
-            self.infer_width,
+            self.infer_scale,
             self.frame_stride,
             self.fps_cap,
             self.blur_kernel,
@@ -769,7 +769,7 @@ class MainWindow(QMainWindow):
             prompt=self.prompt.text().strip() or "target",
             mode=self.mode.currentText(),
             threshold=self.threshold.value() / 100.0,
-            infer_width=int(self.infer_width.currentText()),
+            infer_scale=float(self.infer_scale.currentText()),
             blur_kernel=self.blur_kernel.value(),
             frame_stride=self.frame_stride.value(),
             fps_cap=self.fps_cap.value(),
@@ -925,7 +925,7 @@ class MainWindow(QMainWindow):
         self.sweep_table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             values = [
-                str(row["infer_width"]),
+                f'{row["infer_scale"]:.2f}',
                 f'{row["threshold"]:.2f}',
                 f'{row["latency_ms"]:.1f}',
                 f'{row["mask_coverage"]:.3f}',
@@ -940,7 +940,7 @@ class MainWindow(QMainWindow):
         self.video_position.setText("benchmark")
         self.benchmark_button.setEnabled(False)
         self.benchmark_table.setRowCount(0)
-        self.benchmark_progress.setRange(0, 9)
+        self.benchmark_progress.setRange(0, 12)
         self.benchmark_progress.setValue(0)
         self.benchmark_progress_label.setText("loading benchmark frames...")
         self.benchmark_worker = BenchmarkWorker(
@@ -967,7 +967,7 @@ class MainWindow(QMainWindow):
         row_index = self.benchmark_table.rowCount()
         self.benchmark_table.insertRow(row_index)
         values = [
-            str(row["infer_width"]),
+            f'{row["infer_scale"]:.2f}',
             f'{row["threshold"]:.2f}',
             f'{row["non_target_leakage"]:.4f}',
             f'{row["target_damage"]:.4f}',
