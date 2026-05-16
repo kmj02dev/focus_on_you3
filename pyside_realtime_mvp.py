@@ -935,6 +935,8 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def run_benchmark(self) -> None:
+        self.stop_worker()
+        self.video_position.setText("benchmark")
         self.benchmark_button.setEnabled(False)
         self.benchmark_table.setRowCount(0)
         self.benchmark_progress.setRange(0, 9)
