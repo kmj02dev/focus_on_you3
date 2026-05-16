@@ -440,16 +440,14 @@ class BenchmarkWorker(QThread):
                 tp_total = fp_total = tn_total = fn_total = 0
                 latencies = []
                 started = time.perf_counter()
-                preview_step = max(1, len(frames) // 5)
                 for frame_offset, (frame, gt_mask) in enumerate(zip(frames, gt_masks)):
                     mask, model_latency_ms = self.segmenter.predict_mask(
                         frame,
                         self.settings.prompt,
                         infer_width,
                     )
-                    if frame_offset % preview_step == 0 or frame_offset == len(frames) - 1:
-                        output = apply_effect(frame, mask, threshold, self.settings.mode, self.settings.blur_kernel)
-                        self.preview.emit(bgr_to_qimage(frame), bgr_to_qimage(output))
+                    output = apply_effect(frame, mask, threshold, self.settings.mode, self.settings.blur_kernel)
+                    self.preview.emit(bgr_to_qimage(frame), bgr_to_qimage(output))
                     latencies.append(model_latency_ms)
                     tp, fp, tn, fn = binary_confusion_counts(mask >= threshold, gt_mask)
                     tp_total += tp
