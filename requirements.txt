@@ -4,3 +4,4 @@ torch
 transformers
 numpy
 PySide6
+ultralytics

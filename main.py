@@ -63,12 +63,25 @@ except ImportError as exc:  # pragma: no cover - only used when dependency is mi
     raise
 
 
-MODEL_NAME = "CIDAS/clipseg-rd64-refined"
-MODEL_PRESETS = [
-    "CIDAS/clipseg-rd64-refined",
-    "CIDAS/clipseg-rd64",
-    "CIDAS/clipseg-rd16",
+CLIPSEG_MODEL_NAME = "CIDAS/clipseg-rd64-refined"
+BACKEND_CLIPSEG = "CLIPSeg"
+BACKEND_YOLO_WORLD_BOX = "YOLO-World small box-only"
+BACKEND_YOLO_WORLD_SAM2 = "YOLO-World small + SAM2 tiny tracking"
+BACKEND_SAM3 = "SAM 3"
+BACKEND_GDINO_SAM2 = "Grounding DINO tiny + SAM2 tiny"
+BACKEND_PRESETS = [
+    BACKEND_CLIPSEG,
+    BACKEND_YOLO_WORLD_BOX,
+    BACKEND_YOLO_WORLD_SAM2,
+    BACKEND_SAM3,
+    BACKEND_GDINO_SAM2,
 ]
+RUNNABLE_BACKENDS = {
+    BACKEND_CLIPSEG,
+    BACKEND_YOLO_WORLD_BOX,
+}
+YOLO_WORLD_MODEL = "yolov8s-world.pt"
+YOLOWorld = None
 CAMVID_VIDEO = Path("benchmark_data/camvid_road_0001TP.mp4")
 CAMVID_GT_DIR = Path("benchmark_gt/camvid_road_0001TP")
 
@@ -78,7 +91,7 @@ DEFAULT_SETTINGS = {
     "threshold": 50,
     "infer_scale": "0.50",
     "sweep_prompts": "road",
-    "sweep_models": MODEL_NAME,
+    "sweep_models": BACKEND_CLIPSEG,
     "sweep_scales": "0.25,0.50,0.75,1.00",
     "sweep_thresholds": "0.35,0.50,0.65",
     "sweep_skip_frames": "0",
@@ -224,6 +237,47 @@ def default_device() -> str:
     return "cpu"
 
 
+def get_yolo_world_cls():
+    global YOLOWorld
+    if YOLOWorld is None:
+        try:
+            from ultralytics import YOLOWorld as YOLOWorldClass
+        except ImportError as exc:  # pragma: no cover - optional backend.
+            raise RuntimeError("YOLO-World backends require ultralytics. Install it with: pip install ultralytics") from exc
+        YOLOWorld = YOLOWorldClass
+    return YOLOWorld
+
+
+def prompt_to_classes(prompt: str) -> list[str]:
+    classes = [item.strip() for item in prompt.split(",") if item.strip()]
+    if not classes and prompt.strip():
+        classes = [prompt.strip()]
+    if not classes:
+        raise ValueError("Prompt must contain at least one target class")
+    return classes
+
+
+def backend_unavailable_message(backend_name: str) -> str | None:
+    if backend_name in RUNNABLE_BACKENDS:
+        return None
+    if backend_name == BACKEND_YOLO_WORLD_SAM2:
+        return (
+            "YOLO-World + SAM2 tiny tracking is not runnable yet. "
+            "SAM2 runtime and a tiny checkpoint need to be added first."
+        )
+    if backend_name == BACKEND_SAM3:
+        return (
+            "SAM 3 is not runnable yet. "
+            "SAM 3 runtime and checkpoint need to be added first."
+        )
+    if backend_name == BACKEND_GDINO_SAM2:
+        return (
+            "Grounding DINO tiny + SAM2 tiny is not runnable yet. "
+            "Grounding DINO, SAM2, and tiny checkpoints need to be added first."
+        )
+    return f"Unsupported backend: {backend_name}"
+
+
 def bgr_to_qimage(frame: np.ndarray) -> QImage:
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     height, width, channels = rgb.shape
@@ -342,32 +396,53 @@ def fit_table_to_panel(table: QTableWidget, default_section_size: int = 72) -> N
 
 
 class PromptSegmenter:
-    def __init__(self, model_name: str, device: str) -> None:
-        self.model_name = model_name
+    def __init__(self, backend_name: str, device: str) -> None:
+        self.model_name = backend_name
         self.device = torch.device(device)
         self.processor: CLIPSegProcessor | None = None
         self.model: CLIPSegForImageSegmentation | None = None
+        self.yolo_model = None
         self.lock = threading.Lock()
 
     def load(self) -> None:
+        if self.model_name != BACKEND_CLIPSEG:
+            self.load_yolo_world() if self.model_name == BACKEND_YOLO_WORLD_BOX else self.ensure_backend_available()
+            return
         if self.model is not None and self.processor is not None:
             return
         with self.lock:
             if self.model is not None and self.processor is not None:
                 return
-            self.processor = CLIPSegProcessor.from_pretrained(self.model_name)
-            self.model = CLIPSegForImageSegmentation.from_pretrained(self.model_name).to(self.device)
+            self.processor = CLIPSegProcessor.from_pretrained(CLIPSEG_MODEL_NAME)
+            self.model = CLIPSegForImageSegmentation.from_pretrained(CLIPSEG_MODEL_NAME).to(self.device)
             self.model.eval()
             if self.device.type == "cuda":
                 torch.backends.cudnn.benchmark = True
 
+    def load_yolo_world(self) -> None:
+        if self.yolo_model is not None:
+            return
+        with self.lock:
+            if self.yolo_model is not None:
+                return
+            yolo_cls = get_yolo_world_cls()
+            self.yolo_model = yolo_cls(YOLO_WORLD_MODEL)
+
+    def ensure_backend_available(self) -> None:
+        message = backend_unavailable_message(self.model_name)
+        if message is not None:
+            raise RuntimeError(message)
+
     def set_model(self, model_name: str, device: str) -> None:
         model_name = model_name.strip()
         if not model_name:
-            raise ValueError("Model name cannot be empty")
+            raise ValueError("Backend name cannot be empty")
+        if model_name not in BACKEND_PRESETS:
+            raise ValueError(f"Unsupported backend: {model_name}")
         with self.lock:
             self.processor = None
             self.model = None
+            self.yolo_model = None
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
             self.model_name = model_name
@@ -375,6 +450,10 @@ class PromptSegmenter:
 
     @torch.inference_mode()
     def predict_mask(self, frame: np.ndarray, prompt: str, infer_scale: float) -> tuple[np.ndarray, float]:
+        if self.model_name == BACKEND_YOLO_WORLD_BOX:
+            return self.predict_yolo_world_box_mask(frame, prompt, infer_scale)
+        if self.model_name != BACKEND_CLIPSEG:
+            self.ensure_backend_available()
         self.load()
         assert self.processor is not None
         assert self.model is not None
@@ -409,6 +488,43 @@ class PromptSegmenter:
         )
         mask = torch.sigmoid(upsampled)[0, 0].detach().float().cpu().numpy()
         return mask.astype(np.float32), model_latency_ms
+
+    @torch.inference_mode()
+    def predict_yolo_world_box_mask(self, frame: np.ndarray, prompt: str, infer_scale: float) -> tuple[np.ndarray, float]:
+        self.load_yolo_world()
+        assert self.yolo_model is not None
+
+        classes = prompt_to_classes(prompt)
+        height, width = frame.shape[:2]
+        scale = min(1.0, max(0.05, infer_scale))
+        if scale < 1.0:
+            resized = cv2.resize(frame, (round(width * scale), round(height * scale)), interpolation=cv2.INTER_AREA)
+        else:
+            resized = frame
+
+        self.yolo_model.set_classes(classes)
+        started = time.perf_counter()
+        results = self.yolo_model.predict(resized, verbose=False)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        model_latency_ms = (time.perf_counter() - started) * 1000.0
+
+        mask = np.zeros((height, width), dtype=np.float32)
+        if not results:
+            return mask, model_latency_ms
+        boxes = getattr(results[0], "boxes", None)
+        if boxes is None or boxes.xyxy is None:
+            return mask, model_latency_ms
+        xyxy = boxes.xyxy.detach().cpu().numpy()
+        inv_scale = 1.0 / scale
+        for x1, y1, x2, y2 in xyxy:
+            left = int(max(0, round(x1 * inv_scale)))
+            top = int(max(0, round(y1 * inv_scale)))
+            right = int(min(width, round(x2 * inv_scale)))
+            bottom = int(min(height, round(y2 * inv_scale)))
+            if right > left and bottom > top:
+                mask[top:bottom, left:right] = 1.0
+        return mask, model_latency_ms
 
 
 class CaptureWorker(QThread):
@@ -584,6 +700,7 @@ class InferenceWorker(QThread):
                     )
                 except Exception as exc:
                     self.status.emit(str(exc))
+                    self.running = False
             else:
                 skipped += 1
 
@@ -895,8 +1012,8 @@ class MainWindow(QMainWindow):
         model_box = QGroupBox("Model")
         model_form = QFormLayout(model_box)
         self.model_name = QComboBox()
-        self.model_name.setEditable(True)
-        self.model_name.addItems(MODEL_PRESETS)
+        self.model_name.setEditable(False)
+        self.model_name.addItems(BACKEND_PRESETS)
         self.model_name.setCurrentText(self.segmenter.model_name)
         self.device_name = QComboBox()
         devices = ["cpu"]
@@ -988,7 +1105,7 @@ class MainWindow(QMainWindow):
         sweep_space_form = QFormLayout(sweep_space_box)
         self.sweep_prompts = QLineEdit(DEFAULT_SETTINGS["sweep_prompts"])
         self.sweep_models = QComboBox()
-        self.sweep_models.addItems(MODEL_PRESETS)
+        self.sweep_models.addItems(BACKEND_PRESETS)
         self.sweep_models.setCurrentText(DEFAULT_SETTINGS["sweep_models"])
         self.sweep_scales = QLineEdit(DEFAULT_SETTINGS["sweep_scales"])
         self.sweep_thresholds = QLineEdit(DEFAULT_SETTINGS["sweep_thresholds"])
@@ -1070,7 +1187,7 @@ class MainWindow(QMainWindow):
             self.benchmark_frames,
         ]
 
-        self.status_label = QLabel(f"Device: {self.segmenter.device}. Model loads on first inference.")
+        self.status_label = QLabel(f"Device: {self.segmenter.device}. Backend loads on first inference.")
         self.status_label.setWordWrap(True)
         controls.addWidget(self.status_label)
         controls.addStretch(1)
@@ -1208,11 +1325,18 @@ class MainWindow(QMainWindow):
         if self.benchmark_worker is not None and self.benchmark_worker.isRunning():
             QMessageBox.warning(self, "Benchmark running", "Wait for the current benchmark before switching backends.")
             return
+        requested_backend = self.model_name.currentText()
+        unavailable_message = backend_unavailable_message(requested_backend)
+        if unavailable_message is not None:
+            QMessageBox.warning(self, "Backend unavailable", unavailable_message)
+            self.model_name.setCurrentText(self.segmenter.model_name)
+            return
         self.stop_worker()
         try:
-            self.segmenter.set_model(self.model_name.currentText(), self.device_name.currentText())
+            self.segmenter.set_model(requested_backend, self.device_name.currentText())
         except Exception as exc:
             QMessageBox.warning(self, "Backend switch failed", str(exc))
+            self.model_name.setCurrentText(self.segmenter.model_name)
             return
         self.set_status(
             f"Backend set to {self.segmenter.model_name} on {self.segmenter.device}. "
@@ -1359,6 +1483,11 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "Invalid sweep space", str(exc))
             return
+        for backend_name in sweep_config.model_ids:
+            unavailable_message = backend_unavailable_message(backend_name)
+            if unavailable_message is not None:
+                QMessageBox.warning(self, "Backend unavailable", unavailable_message)
+                return
         if any(model_id != self.segmenter.model_name for model_id in sweep_config.model_ids):
             self.stop_worker()
         self.sweep_button.setEnabled(False)
@@ -1393,6 +1522,11 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "Invalid sweep space", str(exc))
             return
+        for backend_name in sweep_config.model_ids:
+            unavailable_message = backend_unavailable_message(backend_name)
+            if unavailable_message is not None:
+                QMessageBox.warning(self, "Backend unavailable", unavailable_message)
+                return
         self.stop_worker()
         self.video_position.setText("benchmark")
         self.set_hyperparameter_controls_enabled(False)
@@ -1526,7 +1660,7 @@ class MainWindow(QMainWindow):
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PySide6 real-time prompt segmentation MVP.")
-    parser.add_argument("--model", default=MODEL_NAME)
+    parser.add_argument("--backend", default=BACKEND_CLIPSEG, choices=BACKEND_PRESETS)
     parser.add_argument("--device", default=default_device())
     return parser.parse_args(list(argv))
 
@@ -1534,7 +1668,7 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
 def main(argv: Iterable[str] = sys.argv[1:]) -> int:
     args = parse_args(argv)
     app = QApplication(sys.argv)
-    segmenter = PromptSegmenter(args.model, args.device)
+    segmenter = PromptSegmenter(args.backend, args.device)
     window = MainWindow(segmenter)
     window.show()
     return app.exec()

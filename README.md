@@ -68,7 +68,7 @@ Lower `scale` usually improves FPS and latency, but can increase `non_target_lea
 The sweep space is editable in the UI. Backend is selected from a dropdown; the other fields accept comma-separated values:
 
 - `Target prompts`: default `road`
-- `Backend`: default `CIDAS/clipseg-rd64-refined`
+- `Backend`: default `CLIPSeg`
 - `Scales`: default `0.25,0.50,0.75,1.00`
 - `Thresholds`: default `0.35,0.50,0.65`
 - `Skip frames`: default `0`
@@ -76,6 +76,14 @@ The sweep space is editable in the UI. Backend is selected from a dropdown; the 
 The app shows the resulting combination count before running the current-frame sweep or CamVid benchmark. During CamVid benchmark runs, hyperparameter controls are disabled so the run uses a fixed snapshot of the sweep space.
 
 For benchmark `Skip frames`, the app still evaluates every benchmark frame. Skipped frames reuse the most recent mask, matching the live playback path where inference can run slower than video display. Benchmark `latency_ms` is reported per evaluated frame, while saved CSV files also include `model_latency_ms` for model-call latency.
+
+The Backend dropdown exposes these user-facing pipelines:
+
+- `CLIPSeg`: text-to-mask baseline using `CIDAS/clipseg-rd64-refined`.
+- `YOLO-World small box-only`: open-vocabulary detection boxes converted to a binary mask.
+- `YOLO-World small + SAM2 tiny tracking`: visible in the dropdown, but blocked until SAM2 tiny runtime/checkpoint is installed.
+- `SAM 3`: visible in the dropdown, but blocked until SAM 3 runtime/checkpoint is installed.
+- `Grounding DINO tiny + SAM2 tiny`: visible in the dropdown, but blocked until Grounding DINO and SAM2 tiny runtimes/checkpoints are installed.
 
 Use `Reset Hyperparameters` to restore the default prompt/effect/realtime/benchmark settings.
 
