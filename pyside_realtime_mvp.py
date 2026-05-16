@@ -161,6 +161,18 @@ class PromptSegmenter:
             if self.device.type == "cuda":
                 torch.backends.cudnn.benchmark = True
 
+    def set_model(self, model_name: str, device: str) -> None:
+        model_name = model_name.strip()
+        if not model_name:
+            raise ValueError("Model name cannot be empty")
+        with self.lock:
+            self.processor = None
+            self.model = None
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+            self.model_name = model_name
+            self.device = torch.device(device)
+
     @torch.inference_mode()
     def predict_mask(self, frame: np.ndarray, prompt: str, infer_width: int) -> tuple[np.ndarray, float]:
         self.load()
@@ -500,6 +512,32 @@ class MainWindow(QMainWindow):
         controls.setSpacing(12)
         main.addLayout(controls)
 
+        model_box = QGroupBox("Model")
+        model_form = QFormLayout(model_box)
+        self.model_name = QComboBox()
+        self.model_name.setEditable(True)
+        self.model_name.addItems(
+            [
+                "CIDAS/clipseg-rd64-refined",
+                "CIDAS/clipseg-rd64",
+                "CIDAS/clipseg-rd16",
+            ]
+        )
+        self.model_name.setCurrentText(self.segmenter.model_name)
+        self.device_name = QComboBox()
+        devices = ["cpu"]
+        if torch.cuda.is_available():
+            devices.insert(0, "cuda")
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            devices.append("mps")
+        self.device_name.addItems(devices)
+        self.device_name.setCurrentText(str(self.segmenter.device))
+        self.apply_model_button = QPushButton("Apply Model")
+        model_form.addRow("Model ID", self.model_name)
+        model_form.addRow("Device", self.device_name)
+        model_form.addRow(self.apply_model_button)
+        controls.addWidget(model_box)
+
         source_box = QGroupBox("Source")
         source_form = QFormLayout(source_box)
         self.camera_index = QSpinBox()
@@ -592,6 +630,7 @@ class MainWindow(QMainWindow):
 
     def _connect_ui(self) -> None:
         self.threshold.valueChanged.connect(self.on_threshold_changed)
+        self.apply_model_button.clicked.connect(self.apply_model)
         self.browse_button.clicked.connect(self.browse_video)
         self.start_camera_button.clicked.connect(self.start_camera)
         self.start_video_button.clicked.connect(self.start_video)
@@ -650,6 +689,25 @@ class MainWindow(QMainWindow):
     def on_threshold_changed(self, value: int) -> None:
         self.threshold_label.setText(f"{value / 100.0:.2f}")
         self.push_settings()
+
+    @Slot()
+    def apply_model(self) -> None:
+        if self.sweep_worker is not None and self.sweep_worker.isRunning():
+            QMessageBox.warning(self, "Sweep running", "Wait for the current sweep before switching models.")
+            return
+        if self.benchmark_worker is not None and self.benchmark_worker.isRunning():
+            QMessageBox.warning(self, "Benchmark running", "Wait for the current benchmark before switching models.")
+            return
+        self.stop_worker()
+        try:
+            self.segmenter.set_model(self.model_name.currentText(), self.device_name.currentText())
+        except Exception as exc:
+            QMessageBox.warning(self, "Model switch failed", str(exc))
+            return
+        self.set_status(
+            f"Model set to {self.segmenter.model_name} on {self.segmenter.device}. "
+            "It will load on the next inference."
+        )
 
     @Slot()
     def browse_video(self) -> None:

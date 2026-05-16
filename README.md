@@ -45,6 +45,7 @@ python pyside_realtime_mvp.py
 ```
 
 The app supports camera/video input, prompt-based target preservation, non-target blur/removal, live FPS/latency, per-frame optimization sweep, and CamVid GT benchmark metrics.
+The model selector is editable, so you can switch between the bundled CLIPSeg presets or type another compatible Hugging Face model ID.
 
 ## CamVid Benchmark
 
