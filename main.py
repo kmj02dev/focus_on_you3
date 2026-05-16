@@ -413,7 +413,7 @@ class BenchmarkWorker(QThread):
                 raise RuntimeError(f"Could not open {CAMVID_VIDEO}")
 
             frame_index = 0
-            while len(frames) < self.max_frames:
+            while self.max_frames <= 0 or len(frames) < self.max_frames:
                 ok, frame = cap.read()
                 if not ok:
                     break
@@ -689,8 +689,9 @@ class MainWindow(QMainWindow):
         benchmark_box = QGroupBox("GT Benchmark")
         benchmark_layout = QVBoxLayout(benchmark_box)
         self.benchmark_frames = QSpinBox()
-        self.benchmark_frames.setRange(1, 30)
-        self.benchmark_frames.setValue(10)
+        self.benchmark_frames.setRange(0, 100000)
+        self.benchmark_frames.setValue(0)
+        self.benchmark_frames.setSpecialValueText("All")
         self.benchmark_button = QPushButton("Run CamVid Road Benchmark")
         self.benchmark_progress = QProgressBar()
         self.benchmark_progress.setRange(0, 9)

@@ -37,6 +37,8 @@ It supports:
 - optimization sweep on the current frame
 - CamVid GT benchmark sweep with visible progress and every-frame preview
 
+In the GT benchmark controls, `Frames = All` uses every available benchmark frame.
+
 ## CamVid Benchmark
 
 The benchmark helper lives under `benchmark/`:
