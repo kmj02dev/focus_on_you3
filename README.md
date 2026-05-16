@@ -43,7 +43,7 @@ It supports:
 
 - camera start/stop
 - video play/pause/stop/seek
-- editable model selector
+- editable backend selector
 - prompt-based target preservation
 - live effect preview on the same frame as the input feed
 - non-target blur/remove/dim/mask preview in sweeps and GT benchmark runs
@@ -65,12 +65,17 @@ Lower `scale` usually improves FPS and latency, but can increase `non_target_lea
 
 `Skip frames` controls how many live camera/video frames are skipped between model calls. `0` runs inference on every frame, `1` processes every other frame, and `4` processes one frame after skipping four. Larger values should improve playback responsiveness, but per-call `model_latency_ms` can still vary because the GPU may idle, clocks may change, and UI/video decode work continues between inference calls.
 
-The sweep space is editable in the UI as comma-separated values:
+The sweep space is editable in the UI. Backend is selected from a dropdown; the other fields accept comma-separated values:
 
-- `Scales CSV`: default `0.25,0.50,0.75,1.00`
-- `Thresholds CSV`: default `0.35,0.50,0.65`
+- `Target prompts`: default `road`
+- `Backend`: default `CIDAS/clipseg-rd64-refined`
+- `Scales`: default `0.25,0.50,0.75,1.00`
+- `Thresholds`: default `0.35,0.50,0.65`
+- `Skip frames`: default `0`
 
-The app shows the resulting combination count before running the current-frame sweep or CamVid benchmark.
+The app shows the resulting combination count before running the current-frame sweep or CamVid benchmark. During CamVid benchmark runs, hyperparameter controls are disabled so the run uses a fixed snapshot of the sweep space.
+
+For benchmark `Skip frames`, the app still evaluates every benchmark frame. Skipped frames reuse the most recent mask, matching the live playback path where inference can run slower than video display. Benchmark `latency_ms` is reported per evaluated frame, while saved CSV files also include `model_latency_ms` for model-call latency.
 
 Use `Reset Hyperparameters` to restore the default prompt/effect/realtime/benchmark settings.
 

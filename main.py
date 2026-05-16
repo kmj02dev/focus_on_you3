@@ -34,12 +34,14 @@ try:
     from PySide6.QtCore import Qt, QThread, Signal, Slot
     from PySide6.QtGui import QAction, QImage, QPixmap
     from PySide6.QtWidgets import (
+        QAbstractScrollArea,
         QApplication,
         QComboBox,
         QFileDialog,
         QFormLayout,
         QGridLayout,
         QGroupBox,
+        QHeaderView,
         QHBoxLayout,
         QLabel,
         QLineEdit,
@@ -62,6 +64,11 @@ except ImportError as exc:  # pragma: no cover - only used when dependency is mi
 
 
 MODEL_NAME = "CIDAS/clipseg-rd64-refined"
+MODEL_PRESETS = [
+    "CIDAS/clipseg-rd64-refined",
+    "CIDAS/clipseg-rd64",
+    "CIDAS/clipseg-rd16",
+]
 CAMVID_VIDEO = Path("benchmark_data/camvid_road_0001TP.mp4")
 CAMVID_GT_DIR = Path("benchmark_gt/camvid_road_0001TP")
 
@@ -70,8 +77,11 @@ DEFAULT_SETTINGS = {
     "mode": "blur",
     "threshold": 50,
     "infer_scale": "0.50",
+    "sweep_prompts": "road",
+    "sweep_models": MODEL_NAME,
     "sweep_scales": "0.25,0.50,0.75,1.00",
     "sweep_thresholds": "0.35,0.50,0.65",
+    "sweep_skip_frames": "0",
     "blur_kernel": 35,
     "skip_frames": 0,
     "benchmark_frames": 0,
@@ -90,12 +100,21 @@ class RuntimeSettings:
 
 @dataclass
 class SweepConfig:
+    prompts: list[str]
+    model_ids: list[str]
     scales: list[float]
     thresholds: list[float]
+    skip_frames: list[int]
 
     @property
     def combination_count(self) -> int:
-        return len(self.scales) * len(self.thresholds)
+        return (
+            len(self.prompts)
+            * len(self.model_ids)
+            * len(self.scales)
+            * len(self.thresholds)
+            * len(self.skip_frames)
+        )
 
 
 @dataclass
@@ -230,6 +249,31 @@ def parse_float_csv(text: str, minimum: float, maximum: float, label: str) -> li
     return list(dict.fromkeys(values))
 
 
+def parse_int_csv(text: str, minimum: int, maximum: int, label: str) -> list[int]:
+    values: list[int] = []
+    for raw_item in text.split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        try:
+            value = int(item)
+        except ValueError as exc:
+            raise ValueError(f"{label} contains a non-integer: {item!r}") from exc
+        if not minimum <= value <= maximum:
+            raise ValueError(f"{label} value {value:d} is outside [{minimum:d}, {maximum:d}]")
+        values.append(value)
+    if not values:
+        raise ValueError(f"{label} must contain at least one value")
+    return list(dict.fromkeys(values))
+
+
+def parse_text_csv(text: str, label: str) -> list[str]:
+    values = [item.strip() for item in text.split(",") if item.strip()]
+    if not values:
+        raise ValueError(f"{label} must contain at least one value")
+    return list(dict.fromkeys(values))
+
+
 def apply_effect(frame: np.ndarray, mask: np.ndarray, threshold: float, mode: str, blur_kernel: int) -> np.ndarray:
     binary = mask >= threshold
     if mode == "mask":
@@ -283,6 +327,18 @@ def read_gt_mask(path: Path, width: int, height: int) -> np.ndarray:
     if mask.shape[:2] != (height, width):
         mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
     return mask > 0
+
+
+def fit_table_to_panel(table: QTableWidget, default_section_size: int = 72) -> None:
+    table.setSizeAdjustPolicy(QAbstractScrollArea.AdjustIgnored)
+    table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+    table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+    table.setWordWrap(False)
+    table.setMinimumWidth(0)
+    header = table.horizontalHeader()
+    header.setSectionResizeMode(QHeaderView.Interactive)
+    header.setStretchLastSection(False)
+    header.setDefaultSectionSize(default_section_size)
 
 
 class PromptSegmenter:
@@ -554,25 +610,45 @@ class SweepWorker(QThread):
     def run(self) -> None:
         try:
             results = []
-            for infer_scale in self.sweep_config.scales:
-                for threshold in self.sweep_config.thresholds:
-                    started = time.perf_counter()
-                    mask, model_latency_ms = self.segmenter.predict_mask(
-                        self.frame,
-                        self.settings.prompt,
-                        infer_scale,
-                    )
-                    _ = apply_effect(self.frame, mask, threshold, self.settings.mode, self.settings.blur_kernel)
-                    total_ms = (time.perf_counter() - started) * 1000.0
-                    results.append(
-                        {
-                            "infer_scale": infer_scale,
-                            "threshold": threshold,
-                            "latency_ms": total_ms,
-                            "model_latency_ms": model_latency_ms,
-                            "mask_coverage": float((mask >= threshold).mean()),
-                        }
-                    )
+            original_model = self.segmenter.model_name
+            device_name = str(self.segmenter.device)
+            try:
+                for model_id in self.sweep_config.model_ids:
+                    if self.segmenter.model_name != model_id:
+                        self.segmenter.set_model(model_id, device_name)
+                    for prompt in self.sweep_config.prompts:
+                        for skip_frames in self.sweep_config.skip_frames:
+                            for infer_scale in self.sweep_config.scales:
+                                for threshold in self.sweep_config.thresholds:
+                                    started = time.perf_counter()
+                                    mask, model_latency_ms = self.segmenter.predict_mask(
+                                        self.frame,
+                                        prompt,
+                                        infer_scale,
+                                    )
+                                    _ = apply_effect(
+                                        self.frame,
+                                        mask,
+                                        threshold,
+                                        self.settings.mode,
+                                        self.settings.blur_kernel,
+                                    )
+                                    total_ms = (time.perf_counter() - started) * 1000.0
+                                    results.append(
+                                        {
+                                            "model_id": model_id,
+                                            "prompt": prompt,
+                                            "skip_frames": skip_frames,
+                                            "infer_scale": infer_scale,
+                                            "threshold": threshold,
+                                            "latency_ms": total_ms,
+                                            "model_latency_ms": model_latency_ms,
+                                            "mask_coverage": float((mask >= threshold).mean()),
+                                        }
+                                    )
+            finally:
+                if self.segmenter.model_name != original_model:
+                    self.segmenter.set_model(original_model, device_name)
             self.finished_with_results.emit(results)
         except Exception as exc:
             self.status.emit(str(exc))
@@ -627,50 +703,85 @@ class BenchmarkWorker(QThread):
 
             results = []
             combinations = [
-                (scale, threshold)
+                (model_id, prompt, skip_frames, scale, threshold)
+                for model_id in self.sweep_config.model_ids
+                for prompt in self.sweep_config.prompts
+                for skip_frames in self.sweep_config.skip_frames
                 for scale in self.sweep_config.scales
                 for threshold in self.sweep_config.thresholds
             ]
             total_combinations = len(combinations)
-            for combo_index, (infer_scale, threshold) in enumerate(combinations, start=1):
-                self.progress.emit(
-                    combo_index,
-                    total_combinations,
-                    f"scale={infer_scale:.2f}, threshold={threshold:.2f}",
-                )
-                tp_total = fp_total = tn_total = fn_total = 0
-                latencies = []
-                started = time.perf_counter()
-                for frame_offset, (frame, gt_mask) in enumerate(zip(frames, gt_masks)):
-                    mask, model_latency_ms = self.segmenter.predict_mask(
-                        frame,
-                        self.settings.prompt,
-                        infer_scale,
+            original_model = self.segmenter.model_name
+            device_name = str(self.segmenter.device)
+            try:
+                for combo_index, (model_id, prompt, skip_frames, infer_scale, threshold) in enumerate(
+                    combinations,
+                    start=1,
+                ):
+                    if self.segmenter.model_name != model_id:
+                        self.segmenter.set_model(model_id, device_name)
+                    self.progress.emit(
+                        combo_index,
+                        total_combinations,
+                        (
+                            f"backend={model_id}, prompt={prompt}, skip={skip_frames}, "
+                            f"scale={infer_scale:.2f}, threshold={threshold:.2f}"
+                        ),
                     )
-                    output = apply_effect(frame, mask, threshold, self.settings.mode, self.settings.blur_kernel)
-                    self.preview.emit(bgr_to_qimage(frame), bgr_to_qimage(output))
-                    latencies.append(model_latency_ms)
-                    tp, fp, tn, fn = binary_confusion_counts(mask >= threshold, gt_mask)
-                    tp_total += tp
-                    fp_total += fp
-                    tn_total += tn
-                    fn_total += fn
-                elapsed = time.perf_counter() - started
-                leakage, damage = metric_rates(tp_total, fp_total, tn_total, fn_total)
-                row = {
-                    "infer_scale": infer_scale,
-                    "threshold": threshold,
-                    "non_target_leakage": leakage,
-                    "target_damage": damage,
-                    "fps": float(len(frames) / elapsed) if elapsed > 0 else 0.0,
-                    "latency_ms": float(np.mean(latencies)) if latencies else 0.0,
-                    "tp": tp_total,
-                    "fp": fp_total,
-                    "tn": tn_total,
-                    "fn": fn_total,
-                }
-                results.append(row)
-                self.row_ready.emit(row)
+                    tp_total = fp_total = tn_total = fn_total = 0
+                    latencies = []
+                    model_calls = 0
+                    latest_mask: np.ndarray | None = None
+                    process_interval = max(1, skip_frames + 1)
+                    started = time.perf_counter()
+                    for frame_offset, (frame, gt_mask) in enumerate(zip(frames, gt_masks)):
+                        should_process = frame_offset % process_interval == 0 or latest_mask is None
+                        if should_process:
+                            latest_mask, model_latency_ms = self.segmenter.predict_mask(
+                                frame,
+                                prompt,
+                                infer_scale,
+                            )
+                            latencies.append(model_latency_ms)
+                            model_calls += 1
+                        assert latest_mask is not None
+                        output = apply_effect(
+                            frame,
+                            latest_mask,
+                            threshold,
+                            self.settings.mode,
+                            self.settings.blur_kernel,
+                        )
+                        self.preview.emit(bgr_to_qimage(frame), bgr_to_qimage(output))
+                        tp, fp, tn, fn = binary_confusion_counts(latest_mask >= threshold, gt_mask)
+                        tp_total += tp
+                        fp_total += fp
+                        tn_total += tn
+                        fn_total += fn
+                    elapsed = time.perf_counter() - started
+                    leakage, damage = metric_rates(tp_total, fp_total, tn_total, fn_total)
+                    row = {
+                        "model_id": model_id,
+                        "prompt": prompt,
+                        "skip_frames": skip_frames,
+                        "infer_scale": infer_scale,
+                        "threshold": threshold,
+                        "non_target_leakage": leakage,
+                        "target_damage": damage,
+                        "fps": float(len(frames) / elapsed) if elapsed > 0 else 0.0,
+                        "latency_ms": float((elapsed / len(frames)) * 1000.0) if frames else 0.0,
+                        "model_latency_ms": float(np.mean(latencies)) if latencies else 0.0,
+                        "model_calls": model_calls,
+                        "tp": tp_total,
+                        "fp": fp_total,
+                        "tn": tn_total,
+                        "fn": fn_total,
+                    }
+                    results.append(row)
+                    self.row_ready.emit(row)
+            finally:
+                if self.segmenter.model_name != original_model:
+                    self.segmenter.set_model(original_model, device_name)
             self.finished_with_results.emit(results)
         except Exception as exc:
             self.status.emit(str(exc))
@@ -785,13 +896,7 @@ class MainWindow(QMainWindow):
         model_form = QFormLayout(model_box)
         self.model_name = QComboBox()
         self.model_name.setEditable(True)
-        self.model_name.addItems(
-            [
-                "CIDAS/clipseg-rd64-refined",
-                "CIDAS/clipseg-rd64",
-                "CIDAS/clipseg-rd16",
-            ]
-        )
+        self.model_name.addItems(MODEL_PRESETS)
         self.model_name.setCurrentText(self.segmenter.model_name)
         self.device_name = QComboBox()
         devices = ["cpu"]
@@ -802,7 +907,7 @@ class MainWindow(QMainWindow):
         self.device_name.addItems(devices)
         self.device_name.setCurrentText(str(self.segmenter.device))
         self.apply_model_button = QPushButton("Apply Model")
-        model_form.addRow("Model ID", self.model_name)
+        model_form.addRow("Backend", self.model_name)
         model_form.addRow("Device", self.device_name)
         model_form.addRow(self.apply_model_button)
         controls.addWidget(model_box)
@@ -881,20 +986,29 @@ class MainWindow(QMainWindow):
 
         sweep_space_box = QGroupBox("Sweep Space")
         sweep_space_form = QFormLayout(sweep_space_box)
+        self.sweep_prompts = QLineEdit(DEFAULT_SETTINGS["sweep_prompts"])
+        self.sweep_models = QComboBox()
+        self.sweep_models.addItems(MODEL_PRESETS)
+        self.sweep_models.setCurrentText(DEFAULT_SETTINGS["sweep_models"])
         self.sweep_scales = QLineEdit(DEFAULT_SETTINGS["sweep_scales"])
         self.sweep_thresholds = QLineEdit(DEFAULT_SETTINGS["sweep_thresholds"])
+        self.sweep_skip_frames = QLineEdit(DEFAULT_SETTINGS["sweep_skip_frames"])
         self.sweep_estimate = QLabel("")
         self.sweep_estimate.setWordWrap(True)
-        sweep_space_form.addRow("Scales CSV", self.sweep_scales)
-        sweep_space_form.addRow("Thresholds CSV", self.sweep_thresholds)
+        sweep_space_form.addRow("Target prompts", self.sweep_prompts)
+        sweep_space_form.addRow("Backend", self.sweep_models)
+        sweep_space_form.addRow("Scales", self.sweep_scales)
+        sweep_space_form.addRow("Thresholds", self.sweep_thresholds)
+        sweep_space_form.addRow("Skip frames", self.sweep_skip_frames)
         sweep_space_form.addRow("Combinations", self.sweep_estimate)
         controls.addWidget(sweep_space_box)
 
         sweep_box = QGroupBox("Optimization Sweep")
         sweep_layout = QVBoxLayout(sweep_box)
         self.sweep_button = QPushButton("Run Sweep On Current Frame")
-        self.sweep_table = QTableWidget(0, 4)
-        self.sweep_table.setHorizontalHeaderLabels(["scale", "thr", "lat ms", "coverage"])
+        self.sweep_table = QTableWidget(0, 7)
+        self.sweep_table.setHorizontalHeaderLabels(["backend", "prompt", "skip", "scale", "thr", "lat ms", "coverage"])
+        fit_table_to_panel(self.sweep_table)
         self.sweep_table.setMinimumHeight(120)
         self.sweep_table.setMaximumHeight(170)
         sweep_layout.addWidget(self.sweep_button)
@@ -915,8 +1029,13 @@ class MainWindow(QMainWindow):
         self.benchmark_progress.setValue(0)
         self.benchmark_progress.setTextVisible(True)
         self.benchmark_progress_label = QLabel("idle")
-        self.benchmark_table = QTableWidget(0, 6)
-        self.benchmark_table.setHorizontalHeaderLabels(["scale", "thr", "leak", "damage", "FPS", "lat ms"])
+        self.benchmark_progress_label.setWordWrap(True)
+        self.benchmark_progress_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.benchmark_table = QTableWidget(0, 9)
+        self.benchmark_table.setHorizontalHeaderLabels(
+            ["backend", "prompt", "skip", "scale", "thr", "leak", "damage", "FPS", "lat ms"]
+        )
+        fit_table_to_panel(self.benchmark_table, default_section_size=68)
         self.benchmark_table.setMinimumHeight(150)
         self.benchmark_table.setMaximumHeight(210)
         benchmark_form = QFormLayout()
@@ -930,6 +1049,26 @@ class MainWindow(QMainWindow):
         benchmark_layout.addWidget(self.benchmark_progress_label)
         benchmark_layout.addWidget(self.benchmark_table)
         controls.addWidget(benchmark_box)
+
+        self.hyperparameter_controls = [
+            self.model_name,
+            self.device_name,
+            self.apply_model_button,
+            self.prompt,
+            self.mode,
+            self.threshold,
+            self.blur_kernel,
+            self.infer_scale,
+            self.skip_frames,
+            self.reset_hyperparams_button,
+            self.sweep_prompts,
+            self.sweep_models,
+            self.sweep_scales,
+            self.sweep_thresholds,
+            self.sweep_skip_frames,
+            self.sweep_button,
+            self.benchmark_frames,
+        ]
 
         self.status_label = QLabel(f"Device: {self.segmenter.device}. Model loads on first inference.")
         self.status_label.setWordWrap(True)
@@ -955,8 +1094,11 @@ class MainWindow(QMainWindow):
         self.sweep_button.clicked.connect(self.run_sweep)
         self.benchmark_button.clicked.connect(self.run_benchmark)
         self.save_benchmark_button.clicked.connect(self.save_benchmark_results)
+        self.sweep_prompts.textChanged.connect(self.update_sweep_estimate)
+        self.sweep_models.currentTextChanged.connect(self.update_sweep_estimate)
         self.sweep_scales.textChanged.connect(self.update_sweep_estimate)
         self.sweep_thresholds.textChanged.connect(self.update_sweep_estimate)
+        self.sweep_skip_frames.textChanged.connect(self.update_sweep_estimate)
         self.benchmark_frames.valueChanged.connect(self.update_sweep_estimate)
         for widget in [
             self.prompt,
@@ -999,10 +1141,17 @@ class MainWindow(QMainWindow):
             skip_frames=self.skip_frames.value(),
         )
 
+    def set_hyperparameter_controls_enabled(self, enabled: bool) -> None:
+        for widget in self.hyperparameter_controls:
+            widget.setEnabled(enabled)
+
     def current_sweep_config(self) -> SweepConfig:
         return SweepConfig(
+            prompts=parse_text_csv(self.sweep_prompts.text(), "target prompts"),
+            model_ids=[self.sweep_models.currentText()],
             scales=parse_float_csv(self.sweep_scales.text(), 0.05, 1.0, "scales"),
             thresholds=parse_float_csv(self.sweep_thresholds.text(), 0.01, 0.99, "thresholds"),
+            skip_frames=parse_int_csv(self.sweep_skip_frames.text(), 0, 30, "skip frames"),
         )
 
     @Slot()
@@ -1015,7 +1164,9 @@ class MainWindow(QMainWindow):
         frame_text = "all frames" if self.benchmark_frames.value() == 0 else f"{self.benchmark_frames.value()} frames"
         self.sweep_estimate.setText(
             f"{config.combination_count} combinations "
-            f"({len(config.scales)} scales x {len(config.thresholds)} thresholds), benchmark: {frame_text}"
+            f"({len(config.model_ids)} backends x {len(config.prompts)} prompts x "
+            f"{len(config.skip_frames)} skip values x {len(config.scales)} scales x "
+            f"{len(config.thresholds)} thresholds), benchmark: {frame_text}"
         )
 
     @Slot()
@@ -1024,8 +1175,11 @@ class MainWindow(QMainWindow):
         self.mode.setCurrentText(DEFAULT_SETTINGS["mode"])
         self.threshold.setValue(DEFAULT_SETTINGS["threshold"])
         self.infer_scale.setCurrentText(DEFAULT_SETTINGS["infer_scale"])
+        self.sweep_prompts.setText(DEFAULT_SETTINGS["sweep_prompts"])
+        self.sweep_models.setCurrentText(DEFAULT_SETTINGS["sweep_models"])
         self.sweep_scales.setText(DEFAULT_SETTINGS["sweep_scales"])
         self.sweep_thresholds.setText(DEFAULT_SETTINGS["sweep_thresholds"])
+        self.sweep_skip_frames.setText(DEFAULT_SETTINGS["sweep_skip_frames"])
         self.blur_kernel.setValue(DEFAULT_SETTINGS["blur_kernel"])
         self.skip_frames.setValue(DEFAULT_SETTINGS["skip_frames"])
         self.benchmark_frames.setValue(DEFAULT_SETTINGS["benchmark_frames"])
@@ -1049,19 +1203,19 @@ class MainWindow(QMainWindow):
     @Slot()
     def apply_model(self) -> None:
         if self.sweep_worker is not None and self.sweep_worker.isRunning():
-            QMessageBox.warning(self, "Sweep running", "Wait for the current sweep before switching models.")
+            QMessageBox.warning(self, "Sweep running", "Wait for the current sweep before switching backends.")
             return
         if self.benchmark_worker is not None and self.benchmark_worker.isRunning():
-            QMessageBox.warning(self, "Benchmark running", "Wait for the current benchmark before switching models.")
+            QMessageBox.warning(self, "Benchmark running", "Wait for the current benchmark before switching backends.")
             return
         self.stop_worker()
         try:
             self.segmenter.set_model(self.model_name.currentText(), self.device_name.currentText())
         except Exception as exc:
-            QMessageBox.warning(self, "Model switch failed", str(exc))
+            QMessageBox.warning(self, "Backend switch failed", str(exc))
             return
         self.set_status(
-            f"Model set to {self.segmenter.model_name} on {self.segmenter.device}. "
+            f"Backend set to {self.segmenter.model_name} on {self.segmenter.device}. "
             "It will load on the next inference."
         )
 
@@ -1205,6 +1359,8 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "Invalid sweep space", str(exc))
             return
+        if any(model_id != self.segmenter.model_name for model_id in sweep_config.model_ids):
+            self.stop_worker()
         self.sweep_button.setEnabled(False)
         self.sweep_table.setRowCount(0)
         self.sweep_worker = SweepWorker(self.segmenter, frame, self.current_settings(), sweep_config)
@@ -1218,6 +1374,9 @@ class MainWindow(QMainWindow):
         self.sweep_table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             values = [
+                str(row["model_id"]),
+                str(row["prompt"]),
+                str(row["skip_frames"]),
                 f'{row["infer_scale"]:.2f}',
                 f'{row["threshold"]:.2f}',
                 f'{row["latency_ms"]:.1f}',
@@ -1236,6 +1395,7 @@ class MainWindow(QMainWindow):
             return
         self.stop_worker()
         self.video_position.setText("benchmark")
+        self.set_hyperparameter_controls_enabled(False)
         self.benchmark_button.setEnabled(False)
         self.save_benchmark_button.setEnabled(False)
         self.latest_benchmark_results = []
@@ -1254,8 +1414,14 @@ class MainWindow(QMainWindow):
         self.benchmark_worker.preview.connect(self.update_benchmark_preview)
         self.benchmark_worker.finished_with_results.connect(self.populate_benchmark)
         self.benchmark_worker.status.connect(self.set_status)
-        self.benchmark_worker.finished.connect(lambda: self.benchmark_button.setEnabled(True))
+        self.benchmark_worker.finished.connect(self.finish_benchmark_run)
         self.benchmark_worker.start()
+
+    @Slot()
+    def finish_benchmark_run(self) -> None:
+        self.set_hyperparameter_controls_enabled(True)
+        self.benchmark_button.setEnabled(True)
+        self.save_benchmark_button.setEnabled(bool(self.latest_benchmark_results))
 
     @Slot(list)
     def populate_benchmark(self, rows: list[dict]) -> None:
@@ -1286,12 +1452,17 @@ class MainWindow(QMainWindow):
             output_path = output_path.with_suffix(".csv")
 
         fieldnames = [
+            "backend",
+            "prompt",
+            "skip_frames",
             "infer_scale",
             "threshold",
             "non_target_leakage",
             "target_damage",
             "fps",
             "latency_ms",
+            "model_latency_ms",
+            "model_calls",
             "tp",
             "fp",
             "tn",
@@ -1302,7 +1473,9 @@ class MainWindow(QMainWindow):
                 writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
                 writer.writeheader()
                 for row in self.latest_benchmark_results:
-                    writer.writerow({field: row.get(field, "") for field in fieldnames})
+                    output_row = {field: row.get(field, "") for field in fieldnames}
+                    output_row["backend"] = row.get("model_id", "")
+                    writer.writerow(output_row)
         except Exception as exc:
             QMessageBox.warning(self, "Save failed", str(exc))
             return
@@ -1314,6 +1487,9 @@ class MainWindow(QMainWindow):
         row_index = self.benchmark_table.rowCount()
         self.benchmark_table.insertRow(row_index)
         values = [
+            str(row["model_id"]),
+            str(row["prompt"]),
+            str(row["skip_frames"]),
             f'{row["infer_scale"]:.2f}',
             f'{row["threshold"]:.2f}',
             f'{row["non_target_leakage"]:.4f}',
@@ -1330,7 +1506,10 @@ class MainWindow(QMainWindow):
     def update_benchmark_progress(self, current: int, total: int, label: str) -> None:
         self.benchmark_progress.setRange(0, total)
         self.benchmark_progress.setValue(current - 1)
-        self.benchmark_progress_label.setText(f"running {current}/{total}: {label}")
+        compact_label = label
+        if len(compact_label) > 96:
+            compact_label = f"{compact_label[:93]}..."
+        self.benchmark_progress_label.setText(f"running {current}/{total}\n{compact_label}")
 
     @Slot(QImage, QImage)
     def update_benchmark_preview(self, input_image: QImage, output_image: QImage) -> None:
