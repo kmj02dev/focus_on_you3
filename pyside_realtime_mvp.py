@@ -44,6 +44,7 @@ try:
         QLineEdit,
         QMainWindow,
         QMessageBox,
+        QProgressBar,
         QPushButton,
         QSlider,
         QSpinBox,
@@ -387,6 +388,8 @@ class SweepWorker(QThread):
 
 class BenchmarkWorker(QThread):
     finished_with_results = Signal(list)
+    row_ready = Signal(dict)
+    progress = Signal(int, int, str)
     status = Signal(str)
 
     def __init__(self, segmenter: PromptSegmenter, settings: RuntimeSettings, max_frames: int) -> None:
@@ -423,39 +426,45 @@ class BenchmarkWorker(QThread):
                 raise RuntimeError("No benchmark frames with GT masks found")
 
             results = []
-            for infer_width in [128, 192, 256]:
-                for threshold in [0.35, 0.50, 0.65]:
-                    tp_total = fp_total = tn_total = fn_total = 0
-                    latencies = []
-                    started = time.perf_counter()
-                    for frame, gt_mask in zip(frames, gt_masks):
-                        mask, model_latency_ms = self.segmenter.predict_mask(
-                            frame,
-                            self.settings.prompt,
-                            infer_width,
-                        )
-                        latencies.append(model_latency_ms)
-                        tp, fp, tn, fn = binary_confusion_counts(mask >= threshold, gt_mask)
-                        tp_total += tp
-                        fp_total += fp
-                        tn_total += tn
-                        fn_total += fn
-                    elapsed = time.perf_counter() - started
-                    leakage, damage = metric_rates(tp_total, fp_total, tn_total, fn_total)
-                    results.append(
-                        {
-                            "infer_width": infer_width,
-                            "threshold": threshold,
-                            "non_target_leakage": leakage,
-                            "target_damage": damage,
-                            "fps": float(len(frames) / elapsed) if elapsed > 0 else 0.0,
-                            "latency_ms": float(np.mean(latencies)) if latencies else 0.0,
-                            "tp": tp_total,
-                            "fp": fp_total,
-                            "tn": tn_total,
-                            "fn": fn_total,
-                        }
+            combinations = [(width, threshold) for width in [128, 192, 256] for threshold in [0.35, 0.50, 0.65]]
+            total_combinations = len(combinations)
+            for combo_index, (infer_width, threshold) in enumerate(combinations, start=1):
+                self.progress.emit(
+                    combo_index,
+                    total_combinations,
+                    f"width={infer_width}, threshold={threshold:.2f}",
+                )
+                tp_total = fp_total = tn_total = fn_total = 0
+                latencies = []
+                started = time.perf_counter()
+                for frame, gt_mask in zip(frames, gt_masks):
+                    mask, model_latency_ms = self.segmenter.predict_mask(
+                        frame,
+                        self.settings.prompt,
+                        infer_width,
                     )
+                    latencies.append(model_latency_ms)
+                    tp, fp, tn, fn = binary_confusion_counts(mask >= threshold, gt_mask)
+                    tp_total += tp
+                    fp_total += fp
+                    tn_total += tn
+                    fn_total += fn
+                elapsed = time.perf_counter() - started
+                leakage, damage = metric_rates(tp_total, fp_total, tn_total, fn_total)
+                row = {
+                    "infer_width": infer_width,
+                    "threshold": threshold,
+                    "non_target_leakage": leakage,
+                    "target_damage": damage,
+                    "fps": float(len(frames) / elapsed) if elapsed > 0 else 0.0,
+                    "latency_ms": float(np.mean(latencies)) if latencies else 0.0,
+                    "tp": tp_total,
+                    "fp": fp_total,
+                    "tn": tn_total,
+                    "fn": fn_total,
+                }
+                results.append(row)
+                self.row_ready.emit(row)
             self.finished_with_results.emit(results)
         except Exception as exc:
             self.status.emit(str(exc))
@@ -662,12 +671,19 @@ class MainWindow(QMainWindow):
         self.benchmark_frames.setRange(1, 30)
         self.benchmark_frames.setValue(10)
         self.benchmark_button = QPushButton("Run CamVid Road Benchmark")
+        self.benchmark_progress = QProgressBar()
+        self.benchmark_progress.setRange(0, 9)
+        self.benchmark_progress.setValue(0)
+        self.benchmark_progress.setTextVisible(True)
+        self.benchmark_progress_label = QLabel("idle")
         self.benchmark_table = QTableWidget(0, 6)
         self.benchmark_table.setHorizontalHeaderLabels(["width", "thr", "leak", "damage", "FPS", "lat ms"])
         benchmark_form = QFormLayout()
         benchmark_form.addRow("Frames", self.benchmark_frames)
         benchmark_layout.addLayout(benchmark_form)
         benchmark_layout.addWidget(self.benchmark_button)
+        benchmark_layout.addWidget(self.benchmark_progress)
+        benchmark_layout.addWidget(self.benchmark_progress_label)
         benchmark_layout.addWidget(self.benchmark_table)
         controls.addWidget(benchmark_box)
 
@@ -898,11 +914,16 @@ class MainWindow(QMainWindow):
     def run_benchmark(self) -> None:
         self.benchmark_button.setEnabled(False)
         self.benchmark_table.setRowCount(0)
+        self.benchmark_progress.setRange(0, 9)
+        self.benchmark_progress.setValue(0)
+        self.benchmark_progress_label.setText("loading benchmark frames...")
         self.benchmark_worker = BenchmarkWorker(
             self.segmenter,
             self.current_settings(),
             self.benchmark_frames.value(),
         )
+        self.benchmark_worker.row_ready.connect(self.append_benchmark_row)
+        self.benchmark_worker.progress.connect(self.update_benchmark_progress)
         self.benchmark_worker.finished_with_results.connect(self.populate_benchmark)
         self.benchmark_worker.status.connect(self.set_status)
         self.benchmark_worker.finished.connect(lambda: self.benchmark_button.setEnabled(True))
@@ -910,19 +931,32 @@ class MainWindow(QMainWindow):
 
     @Slot(list)
     def populate_benchmark(self, rows: list[dict]) -> None:
-        self.benchmark_table.setRowCount(len(rows))
-        for row_index, row in enumerate(rows):
-            values = [
-                str(row["infer_width"]),
-                f'{row["threshold"]:.2f}',
-                f'{row["non_target_leakage"]:.4f}',
-                f'{row["target_damage"]:.4f}',
-                f'{row["fps"]:.2f}',
-                f'{row["latency_ms"]:.1f}',
-            ]
-            for col, value in enumerate(values):
-                self.benchmark_table.setItem(row_index, col, QTableWidgetItem(value))
+        self.benchmark_progress.setValue(self.benchmark_progress.maximum())
+        self.benchmark_progress_label.setText(f"complete: {len(rows)} combinations")
         self.set_status("Benchmark complete")
+
+    @Slot(dict)
+    def append_benchmark_row(self, row: dict) -> None:
+        row_index = self.benchmark_table.rowCount()
+        self.benchmark_table.insertRow(row_index)
+        values = [
+            str(row["infer_width"]),
+            f'{row["threshold"]:.2f}',
+            f'{row["non_target_leakage"]:.4f}',
+            f'{row["target_damage"]:.4f}',
+            f'{row["fps"]:.2f}',
+            f'{row["latency_ms"]:.1f}',
+        ]
+        for col, value in enumerate(values):
+            self.benchmark_table.setItem(row_index, col, QTableWidgetItem(value))
+        self.benchmark_table.scrollToBottom()
+        self.benchmark_progress.setValue(row_index + 1)
+
+    @Slot(int, int, str)
+    def update_benchmark_progress(self, current: int, total: int, label: str) -> None:
+        self.benchmark_progress.setRange(0, total)
+        self.benchmark_progress.setValue(current - 1)
+        self.benchmark_progress_label.setText(f"running {current}/{total}: {label}")
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         self.stop_worker()

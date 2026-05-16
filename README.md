@@ -44,7 +44,7 @@ Run the PySide6 single-file MVP:
 python pyside_realtime_mvp.py
 ```
 
-The app supports camera/video input, separate camera start/stop controls, video play/pause/stop/seek controls, prompt-based target preservation, non-target blur/removal, live FPS/latency, per-frame optimization sweep, and CamVid GT benchmark metrics.
+The app supports camera/video input, separate camera start/stop controls, video play/pause/stop/seek controls, prompt-based target preservation, non-target blur/removal, live FPS/latency, per-frame optimization sweep, and CamVid GT benchmark metrics with visible sweep progress.
 The model selector is editable, so you can switch between the bundled CLIPSeg presets or type another compatible Hugging Face model ID.
 
 ## CamVid Benchmark
