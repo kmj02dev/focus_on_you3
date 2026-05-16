@@ -216,6 +216,8 @@ class VideoWorker(QThread):
     output_frame = Signal(QImage)
     metrics = Signal(object)
     status = Signal(str)
+    position_changed = Signal(int, int)
+    video_info = Signal(int, float)
 
     def __init__(self, segmenter: PromptSegmenter) -> None:
         super().__init__()
@@ -224,6 +226,9 @@ class VideoWorker(QThread):
         self.settings_lock = threading.Lock()
         self.source: int | str = 0
         self.running = False
+        self.paused = False
+        self.seek_frame: int | None = None
+        self.control_lock = threading.Lock()
         self.latest_frame: np.ndarray | None = None
         self.latest_frame_lock = threading.Lock()
 
@@ -233,9 +238,24 @@ class VideoWorker(QThread):
 
     def set_source(self, source: int | str) -> None:
         self.source = source
+        with self.control_lock:
+            self.paused = False
+            self.seek_frame = None
 
     def stop(self) -> None:
         self.running = False
+
+    def pause(self) -> None:
+        with self.control_lock:
+            self.paused = True
+
+    def resume(self) -> None:
+        with self.control_lock:
+            self.paused = False
+
+    def seek(self, frame_index: int) -> None:
+        with self.control_lock:
+            self.seek_frame = max(0, frame_index)
 
     def snapshot(self) -> np.ndarray | None:
         with self.latest_frame_lock:
@@ -249,23 +269,36 @@ class VideoWorker(QThread):
             return
 
         frame_index = 0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if isinstance(self.source, str) else 0
+        source_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
         processed = 0
         skipped = 0
         last_emit = time.perf_counter()
         self.status.emit("source opened")
+        self.video_info.emit(total_frames, float(source_fps))
 
         while self.running:
             loop_started = time.perf_counter()
+            with self.control_lock:
+                paused = self.paused
+                requested_seek = self.seek_frame
+                self.seek_frame = None
+
+            if requested_seek is not None and isinstance(self.source, str):
+                frame_index = min(requested_seek, max(0, total_frames - 1)) if total_frames > 0 else requested_seek
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            elif paused:
+                time.sleep(0.03)
+                continue
+
             ok, frame = cap.read()
             if not ok:
-                if isinstance(self.source, str):
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    continue
                 break
 
             with self.latest_frame_lock:
                 self.latest_frame = frame.copy()
             self.input_frame.emit(bgr_to_qimage(frame))
+            self.position_changed.emit(frame_index, total_frames)
 
             with self.settings_lock:
                 settings = RuntimeSettings(**self.settings.__dict__)
@@ -303,6 +336,8 @@ class VideoWorker(QThread):
                 skipped += 1
 
             frame_index += 1
+            if paused:
+                continue
             fps_cap = max(1, settings.fps_cap)
             target_dt = 1.0 / fps_cap
             spent = time.perf_counter() - loop_started
@@ -538,23 +573,40 @@ class MainWindow(QMainWindow):
         model_form.addRow(self.apply_model_button)
         controls.addWidget(model_box)
 
-        source_box = QGroupBox("Source")
+        source_box = QGroupBox("Source Controls")
         source_form = QFormLayout(source_box)
         self.camera_index = QSpinBox()
         self.camera_index.setRange(0, 8)
+        self.start_camera_button = QPushButton("Start Camera")
+        self.stop_camera_button = QPushButton("Stop Camera")
+        camera_row = QHBoxLayout()
+        camera_row.addWidget(self.start_camera_button)
+        camera_row.addWidget(self.stop_camera_button)
+
         self.video_path = QLineEdit()
         self.video_path.setPlaceholderText("Select a video file")
         self.browse_button = QPushButton("Browse")
         path_row = QHBoxLayout()
         path_row.addWidget(self.video_path)
         path_row.addWidget(self.browse_button)
-        self.start_camera_button = QPushButton("Start Camera")
-        self.start_video_button = QPushButton("Start Video")
-        self.stop_button = QPushButton("Stop")
+        self.play_video_button = QPushButton("Play Video")
+        self.pause_video_button = QPushButton("Pause")
+        self.stop_video_button = QPushButton("Stop Video")
+        video_button_row = QHBoxLayout()
+        video_button_row.addWidget(self.play_video_button)
+        video_button_row.addWidget(self.pause_video_button)
+        video_button_row.addWidget(self.stop_video_button)
+        self.video_seek = QSlider(Qt.Horizontal)
+        self.video_seek.setRange(0, 0)
+        self.video_position = QLabel("0 / 0")
+        seek_row = QHBoxLayout()
+        seek_row.addWidget(self.video_seek)
+        seek_row.addWidget(self.video_position)
         source_form.addRow("Camera index", self.camera_index)
+        source_form.addRow(camera_row)
         source_form.addRow("Video file", path_row)
-        source_form.addRow(self.start_camera_button, self.start_video_button)
-        source_form.addRow(self.stop_button)
+        source_form.addRow(video_button_row)
+        source_form.addRow("Video position", seek_row)
         controls.addWidget(source_box)
 
         prompt_box = QGroupBox("Prompt & Effect")
@@ -633,8 +685,11 @@ class MainWindow(QMainWindow):
         self.apply_model_button.clicked.connect(self.apply_model)
         self.browse_button.clicked.connect(self.browse_video)
         self.start_camera_button.clicked.connect(self.start_camera)
-        self.start_video_button.clicked.connect(self.start_video)
-        self.stop_button.clicked.connect(self.stop_worker)
+        self.stop_camera_button.clicked.connect(self.stop_camera)
+        self.play_video_button.clicked.connect(self.play_video)
+        self.pause_video_button.clicked.connect(self.pause_video)
+        self.stop_video_button.clicked.connect(self.stop_video)
+        self.video_seek.sliderReleased.connect(self.seek_video)
         self.sweep_button.clicked.connect(self.run_sweep)
         self.benchmark_button.clicked.connect(self.run_benchmark)
         for widget in [
@@ -724,20 +779,72 @@ class MainWindow(QMainWindow):
         self.worker.output_frame.connect(self.output_pane.set_image)
         self.worker.metrics.connect(self.update_metrics)
         self.worker.status.connect(self.set_status)
+        self.worker.video_info.connect(self.update_video_info)
+        self.worker.position_changed.connect(self.update_video_position)
         self.worker.start()
 
     @Slot()
     def start_camera(self) -> None:
+        self.video_seek.setRange(0, 0)
+        self.video_position.setText("camera")
         self.start_source(self.camera_index.value())
 
     @Slot()
-    def start_video(self) -> None:
+    def stop_camera(self) -> None:
+        self.stop_worker()
+        self.video_position.setText("0 / 0")
+
+    @Slot()
+    def play_video(self) -> None:
         path = self.video_path.text().strip()
         if not path:
             self.browse_video()
             path = self.video_path.text().strip()
-        if path:
-            self.start_source(path)
+        if not path:
+            return
+        if self.worker is not None and self.worker.source == path:
+            self.worker.resume()
+            self.set_status("video resumed")
+            return
+        self.start_source(path)
+
+    @Slot()
+    def pause_video(self) -> None:
+        if self.worker is not None and isinstance(self.worker.source, str):
+            self.worker.pause()
+            self.set_status("video paused")
+
+    @Slot()
+    def stop_video(self) -> None:
+        self.stop_worker()
+        self.video_seek.blockSignals(True)
+        self.video_seek.setValue(0)
+        self.video_seek.blockSignals(False)
+        maximum = self.video_seek.maximum()
+        self.video_position.setText(f"0 / {maximum}")
+
+    @Slot()
+    def seek_video(self) -> None:
+        if self.worker is not None and isinstance(self.worker.source, str):
+            self.worker.seek(self.video_seek.value())
+
+    @Slot(int, float)
+    def update_video_info(self, total_frames: int, fps: float) -> None:
+        if total_frames > 0:
+            self.video_seek.setRange(0, max(0, total_frames - 1))
+            self.video_position.setText(f"0 / {total_frames - 1} ({fps:.1f} fps)")
+        else:
+            self.video_seek.setRange(0, 0)
+            self.video_position.setText("camera")
+
+    @Slot(int, int)
+    def update_video_position(self, frame_index: int, total_frames: int) -> None:
+        if total_frames <= 0:
+            return
+        self.video_seek.blockSignals(True)
+        self.video_seek.setValue(min(frame_index, self.video_seek.maximum()))
+        self.video_seek.blockSignals(False)
+        self.video_position.setText(f"{frame_index} / {max(0, total_frames - 1)}")
 
     @Slot()
     def stop_worker(self) -> None:
