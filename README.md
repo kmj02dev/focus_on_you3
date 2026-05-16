@@ -50,6 +50,8 @@ It supports:
 - optimization sweep on the current frame
 - CamVid GT benchmark sweep with visible progress and every-frame preview
 
+Live playback uses a split pipeline: one worker captures camera/video frames and another worker runs inference on the latest available frame. This keeps input playback responsive even when model inference is slower than the capture rate.
+
 In the GT benchmark controls, `Frames = All` uses every available benchmark frame.
 
 The main resolution hyperparameter is `scale`, not absolute width. `scale` controls the inference resolution relative to the original frame:

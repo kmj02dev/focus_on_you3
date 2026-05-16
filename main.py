@@ -108,6 +108,46 @@ class FrameMetrics:
     infer_scale: float
 
 
+@dataclass
+class CapturedFrame:
+    frame: np.ndarray
+    frame_index: int
+    total_frames: int
+    captured_at: float
+    sequence: int
+
+
+class LatestFrameBuffer:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.latest: CapturedFrame | None = None
+        self.sequence = 0
+
+    def update(self, frame: np.ndarray, frame_index: int, total_frames: int) -> None:
+        with self.lock:
+            self.sequence += 1
+            self.latest = CapturedFrame(
+                frame=frame.copy(),
+                frame_index=frame_index,
+                total_frames=total_frames,
+                captured_at=time.perf_counter(),
+                sequence=self.sequence,
+            )
+
+    def get_latest(self) -> CapturedFrame | None:
+        with self.lock:
+            if self.latest is None:
+                return None
+            latest = self.latest
+            return CapturedFrame(
+                frame=latest.frame.copy(),
+                frame_index=latest.frame_index,
+                total_frames=latest.total_frames,
+                captured_at=latest.captured_at,
+                sequence=latest.sequence,
+            )
+
+
 def default_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
@@ -253,30 +293,20 @@ class PromptSegmenter:
         return mask.astype(np.float32), model_latency_ms
 
 
-class VideoWorker(QThread):
+class CaptureWorker(QThread):
     input_frame = Signal(QImage)
-    output_frame = Signal(QImage)
-    metrics = Signal(object)
     status = Signal(str)
     position_changed = Signal(int, int)
     video_info = Signal(int, float)
 
-    def __init__(self, segmenter: PromptSegmenter) -> None:
+    def __init__(self, frame_buffer: LatestFrameBuffer) -> None:
         super().__init__()
-        self.segmenter = segmenter
-        self.settings = RuntimeSettings()
-        self.settings_lock = threading.Lock()
+        self.frame_buffer = frame_buffer
         self.source: int | str = 0
         self.running = False
         self.paused = False
         self.seek_frame: int | None = None
         self.control_lock = threading.Lock()
-        self.latest_frame: np.ndarray | None = None
-        self.latest_frame_lock = threading.Lock()
-
-    def configure(self, settings: RuntimeSettings) -> None:
-        with self.settings_lock:
-            self.settings = settings
 
     def set_source(self, source: int | str) -> None:
         self.source = source
@@ -299,10 +329,6 @@ class VideoWorker(QThread):
         with self.control_lock:
             self.seek_frame = max(0, frame_index)
 
-    def snapshot(self) -> np.ndarray | None:
-        with self.latest_frame_lock:
-            return None if self.latest_frame is None else self.latest_frame.copy()
-
     def run(self) -> None:
         self.running = True
         cap = cv2.VideoCapture(self.source)
@@ -320,6 +346,7 @@ class VideoWorker(QThread):
         self.video_info.emit(total_frames, float(source_fps))
 
         while self.running:
+            loop_started = time.perf_counter()
             with self.control_lock:
                 paused = self.paused
                 requested_seek = self.seek_frame
@@ -336,34 +363,84 @@ class VideoWorker(QThread):
             if not ok:
                 break
 
-            with self.latest_frame_lock:
-                self.latest_frame = frame.copy()
+            self.frame_buffer.update(frame, frame_index, total_frames)
             self.input_frame.emit(bgr_to_qimage(frame))
             self.position_changed.emit(frame_index, total_frames)
+            frame_index += 1
+
+            if isinstance(self.source, str) and source_fps > 0:
+                frame_interval = 1.0 / source_fps
+                spent = time.perf_counter() - loop_started
+                if spent < frame_interval:
+                    time.sleep(frame_interval - spent)
+
+        cap.release()
+        self.status.emit("capture stopped")
+
+
+class InferenceWorker(QThread):
+    output_frame = Signal(QImage)
+    metrics = Signal(object)
+    status = Signal(str)
+
+    def __init__(self, segmenter: PromptSegmenter, frame_buffer: LatestFrameBuffer) -> None:
+        super().__init__()
+        self.segmenter = segmenter
+        self.frame_buffer = frame_buffer
+        self.settings = RuntimeSettings()
+        self.settings_lock = threading.Lock()
+        self.running = False
+
+    def configure(self, settings: RuntimeSettings) -> None:
+        with self.settings_lock:
+            self.settings = settings
+
+    def stop(self) -> None:
+        self.running = False
+
+    def run(self) -> None:
+        self.running = True
+        processed = 0
+        skipped = 0
+        last_emit = time.perf_counter()
+        last_sequence = 0
+        self.status.emit("inference started")
+
+        while self.running:
+            captured = self.frame_buffer.get_latest()
+            if captured is None or captured.sequence == last_sequence:
+                time.sleep(0.005)
+                continue
+            last_sequence = captured.sequence
 
             with self.settings_lock:
                 settings = RuntimeSettings(**self.settings.__dict__)
 
-            should_process = frame_index % max(1, settings.frame_stride) == 0
+            should_process = captured.frame_index % max(1, settings.frame_stride) == 0
             if should_process and settings.prompt.strip():
                 started = time.perf_counter()
                 try:
                     mask, model_latency_ms = self.segmenter.predict_mask(
-                        frame,
+                        captured.frame,
                         settings.prompt.strip(),
                         settings.infer_scale,
                     )
-                    output = apply_effect(frame, mask, settings.threshold, settings.mode, settings.blur_kernel)
+                    output = apply_effect(
+                        captured.frame,
+                        mask,
+                        settings.threshold,
+                        settings.mode,
+                        settings.blur_kernel,
+                    )
                     processed += 1
                     self.output_frame.emit(bgr_to_qimage(output))
-                    elapsed = time.perf_counter() - started
                     now = time.perf_counter()
                     fps = 1.0 / max(1e-6, now - last_emit)
                     last_emit = now
                     self.metrics.emit(
                         FrameMetrics(
                             fps=fps,
-                            latency_ms=elapsed * 1000.0,
+                            latency_ms=(now - captured.captured_at) * 1000.0,
                             model_latency_ms=model_latency_ms,
                             mask_coverage=float((mask >= settings.threshold).mean()),
                             processed_frames=processed,
@@ -376,10 +453,7 @@ class VideoWorker(QThread):
             else:
                 skipped += 1
 
-            frame_index += 1
-
-        cap.release()
-        self.status.emit("stopped")
+        self.status.emit("inference stopped")
 
 
 class SweepWorker(QThread):
@@ -560,7 +634,10 @@ class MainWindow(QMainWindow):
     def __init__(self, segmenter: PromptSegmenter) -> None:
         super().__init__()
         self.segmenter = segmenter
-        self.worker: VideoWorker | None = None
+        self.frame_buffer: LatestFrameBuffer | None = None
+        self.capture_worker: CaptureWorker | None = None
+        self.inference_worker: InferenceWorker | None = None
+        self.active_source: int | str | None = None
         self.sweep_worker: SweepWorker | None = None
         self.benchmark_worker: BenchmarkWorker | None = None
 
@@ -872,8 +949,8 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def push_settings(self, *args) -> None:  # type: ignore[no-untyped-def]
-        if self.worker is not None:
-            self.worker.configure(self.current_settings())
+        if self.inference_worker is not None:
+            self.inference_worker.configure(self.current_settings())
 
     @Slot(int)
     def on_threshold_changed(self, value: int) -> None:
@@ -907,16 +984,22 @@ class MainWindow(QMainWindow):
 
     def start_source(self, source: int | str) -> None:
         self.stop_worker()
-        self.worker = VideoWorker(self.segmenter)
-        self.worker.set_source(source)
-        self.worker.configure(self.current_settings())
-        self.worker.input_frame.connect(self.input_pane.set_image)
-        self.worker.output_frame.connect(self.output_pane.set_image)
-        self.worker.metrics.connect(self.update_metrics)
-        self.worker.status.connect(self.set_status)
-        self.worker.video_info.connect(self.update_video_info)
-        self.worker.position_changed.connect(self.update_video_position)
-        self.worker.start()
+        self.active_source = source
+        self.frame_buffer = LatestFrameBuffer()
+        self.capture_worker = CaptureWorker(self.frame_buffer)
+        self.inference_worker = InferenceWorker(self.segmenter, self.frame_buffer)
+        self.capture_worker.set_source(source)
+        self.inference_worker.configure(self.current_settings())
+        self.capture_worker.input_frame.connect(self.input_pane.set_image)
+        self.capture_worker.status.connect(self.set_status)
+        self.capture_worker.video_info.connect(self.update_video_info)
+        self.capture_worker.position_changed.connect(self.update_video_position)
+        self.capture_worker.finished.connect(self.handle_capture_finished)
+        self.inference_worker.output_frame.connect(self.output_pane.set_image)
+        self.inference_worker.metrics.connect(self.update_metrics)
+        self.inference_worker.status.connect(self.set_status)
+        self.capture_worker.start()
+        self.inference_worker.start()
 
     @Slot()
     def start_camera(self) -> None:
@@ -937,16 +1020,16 @@ class MainWindow(QMainWindow):
             path = self.video_path.text().strip()
         if not path:
             return
-        if self.worker is not None and self.worker.source == path:
-            self.worker.resume()
+        if self.capture_worker is not None and self.active_source == path:
+            self.capture_worker.resume()
             self.set_status("video resumed")
             return
         self.start_source(path)
 
     @Slot()
     def pause_video(self) -> None:
-        if self.worker is not None and isinstance(self.worker.source, str):
-            self.worker.pause()
+        if self.capture_worker is not None and isinstance(self.active_source, str):
+            self.capture_worker.pause()
             self.set_status("video paused")
 
     @Slot()
@@ -960,8 +1043,8 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def seek_video(self) -> None:
-        if self.worker is not None and isinstance(self.worker.source, str):
-            self.worker.seek(self.video_seek.value())
+        if self.capture_worker is not None and isinstance(self.active_source, str):
+            self.capture_worker.seek(self.video_seek.value())
 
     @Slot(int, float)
     def update_video_info(self, total_frames: int, fps: float) -> None:
@@ -983,11 +1066,30 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def stop_worker(self) -> None:
-        if self.worker is None:
-            return
-        self.worker.stop()
-        self.worker.wait(1500)
-        self.worker = None
+        capture_worker = self.capture_worker
+        inference_worker = self.inference_worker
+        if capture_worker is not None:
+            capture_worker.stop()
+        if inference_worker is not None:
+            inference_worker.stop()
+        if capture_worker is not None:
+            capture_worker.wait(1500)
+        if inference_worker is not None:
+            inference_worker.wait(1500)
+        self.capture_worker = None
+        self.inference_worker = None
+        self.active_source = None
+        self.frame_buffer = None
+
+    @Slot()
+    def handle_capture_finished(self) -> None:
+        if self.inference_worker is not None:
+            self.inference_worker.stop()
+            self.inference_worker.wait(1500)
+        self.inference_worker = None
+        self.capture_worker = None
+        self.active_source = None
+        self.frame_buffer = None
 
     @Slot(object)
     def update_metrics(self, metrics: FrameMetrics) -> None:
@@ -1003,7 +1105,8 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def run_sweep(self) -> None:
-        frame = self.worker.snapshot() if self.worker is not None else None
+        latest = self.frame_buffer.get_latest() if self.frame_buffer is not None else None
+        frame = latest.frame if latest is not None else None
         if frame is None:
             QMessageBox.warning(self, "No frame", "Start a camera or video source first.")
             return
