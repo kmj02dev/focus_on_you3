@@ -65,6 +65,8 @@ The benchmark sweep currently tests:
 - `scale`: `0.25`, `0.50`, `0.75`, `1.00`
 - `threshold`: `0.35`, `0.50`, `0.65`
 
+Use `Reset Hyperparameters` to restore the default prompt/effect/realtime/benchmark settings.
+
 ## CamVid Benchmark
 
 The benchmark helper lives under `benchmark/`:

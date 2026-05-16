@@ -64,6 +64,17 @@ MODEL_NAME = "CIDAS/clipseg-rd64-refined"
 CAMVID_VIDEO = Path("benchmark_data/camvid_road_0001TP.mp4")
 CAMVID_GT_DIR = Path("benchmark_gt/camvid_road_0001TP")
 
+DEFAULT_SETTINGS = {
+    "prompt": "road",
+    "mode": "blur",
+    "threshold": 50,
+    "infer_scale": "0.50",
+    "blur_kernel": 35,
+    "frame_stride": 1,
+    "fps_cap": 15,
+    "benchmark_frames": 0,
+}
+
 
 @dataclass
 class RuntimeSettings:
@@ -639,12 +650,12 @@ class MainWindow(QMainWindow):
 
         prompt_box = QGroupBox("Prompt & Effect")
         prompt_form = QFormLayout(prompt_box)
-        self.prompt = QLineEdit("road")
+        self.prompt = QLineEdit(DEFAULT_SETTINGS["prompt"])
         self.mode = QComboBox()
         self.mode.addItems(["blur", "remove", "dim", "mask"])
         self.threshold = QSlider(Qt.Horizontal)
         self.threshold.setRange(5, 95)
-        self.threshold.setValue(50)
+        self.threshold.setValue(DEFAULT_SETTINGS["threshold"])
         self.threshold_label = QLabel("0.50")
         threshold_row = QHBoxLayout()
         threshold_row.addWidget(self.threshold)
@@ -652,7 +663,7 @@ class MainWindow(QMainWindow):
         self.blur_kernel = QSpinBox()
         self.blur_kernel.setRange(3, 99)
         self.blur_kernel.setSingleStep(2)
-        self.blur_kernel.setValue(35)
+        self.blur_kernel.setValue(DEFAULT_SETTINGS["blur_kernel"])
         prompt_form.addRow("Target prompt", self.prompt)
         prompt_form.addRow("Mode", self.mode)
         prompt_form.addRow("Threshold", threshold_row)
@@ -663,16 +674,18 @@ class MainWindow(QMainWindow):
         realtime_form = QFormLayout(realtime_box)
         self.infer_scale = QComboBox()
         self.infer_scale.addItems(["0.25", "0.50", "0.75", "1.00"])
-        self.infer_scale.setCurrentText("0.50")
+        self.infer_scale.setCurrentText(DEFAULT_SETTINGS["infer_scale"])
         self.frame_stride = QSpinBox()
         self.frame_stride.setRange(1, 30)
-        self.frame_stride.setValue(1)
+        self.frame_stride.setValue(DEFAULT_SETTINGS["frame_stride"])
         self.fps_cap = QSpinBox()
         self.fps_cap.setRange(1, 60)
-        self.fps_cap.setValue(15)
+        self.fps_cap.setValue(DEFAULT_SETTINGS["fps_cap"])
+        self.reset_hyperparams_button = QPushButton("Reset Hyperparameters")
         realtime_form.addRow("Inference scale", self.infer_scale)
         realtime_form.addRow("Process every N frames", self.frame_stride)
         realtime_form.addRow("Target FPS cap", self.fps_cap)
+        realtime_form.addRow(self.reset_hyperparams_button)
         controls.addWidget(realtime_box)
 
         sweep_box = QGroupBox("Optimization Sweep")
@@ -690,7 +703,7 @@ class MainWindow(QMainWindow):
         benchmark_layout = QVBoxLayout(benchmark_box)
         self.benchmark_frames = QSpinBox()
         self.benchmark_frames.setRange(0, 100000)
-        self.benchmark_frames.setValue(0)
+        self.benchmark_frames.setValue(DEFAULT_SETTINGS["benchmark_frames"])
         self.benchmark_frames.setSpecialValueText("All")
         self.benchmark_button = QPushButton("Run CamVid Road Benchmark")
         self.benchmark_progress = QProgressBar()
@@ -730,6 +743,7 @@ class MainWindow(QMainWindow):
         self.pause_video_button.clicked.connect(self.pause_video)
         self.stop_video_button.clicked.connect(self.stop_video)
         self.video_seek.sliderReleased.connect(self.seek_video)
+        self.reset_hyperparams_button.clicked.connect(self.reset_hyperparameters)
         self.sweep_button.clicked.connect(self.run_sweep)
         self.benchmark_button.clicked.connect(self.run_benchmark)
         for widget in [
@@ -774,6 +788,19 @@ class MainWindow(QMainWindow):
             frame_stride=self.frame_stride.value(),
             fps_cap=self.fps_cap.value(),
         )
+
+    @Slot()
+    def reset_hyperparameters(self) -> None:
+        self.prompt.setText(DEFAULT_SETTINGS["prompt"])
+        self.mode.setCurrentText(DEFAULT_SETTINGS["mode"])
+        self.threshold.setValue(DEFAULT_SETTINGS["threshold"])
+        self.infer_scale.setCurrentText(DEFAULT_SETTINGS["infer_scale"])
+        self.blur_kernel.setValue(DEFAULT_SETTINGS["blur_kernel"])
+        self.frame_stride.setValue(DEFAULT_SETTINGS["frame_stride"])
+        self.fps_cap.setValue(DEFAULT_SETTINGS["fps_cap"])
+        self.benchmark_frames.setValue(DEFAULT_SETTINGS["benchmark_frames"])
+        self.push_settings()
+        self.set_status("Hyperparameters reset to defaults")
 
     @Slot()
     def push_settings(self, *args) -> None:  # type: ignore[no-untyped-def]
