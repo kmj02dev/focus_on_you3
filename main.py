@@ -72,7 +72,7 @@ DEFAULT_SETTINGS = {
     "sweep_scales": "0.25,0.50,0.75,1.00",
     "sweep_thresholds": "0.35,0.50,0.65",
     "blur_kernel": 35,
-    "frame_stride": 1,
+    "skip_frames": 0,
     "benchmark_frames": 0,
 }
 
@@ -84,7 +84,7 @@ class RuntimeSettings:
     threshold: float = 0.5
     infer_scale: float = 0.5
     blur_kernel: int = 35
-    frame_stride: int = 1
+    skip_frames: int = 0
 
 
 @dataclass
@@ -416,7 +416,8 @@ class InferenceWorker(QThread):
             with self.settings_lock:
                 settings = RuntimeSettings(**self.settings.__dict__)
 
-            should_process = captured.frame_index % max(1, settings.frame_stride) == 0
+            process_interval = max(1, settings.skip_frames + 1)
+            should_process = captured.frame_index % process_interval == 0
             if should_process and settings.prompt.strip():
                 started = time.perf_counter()
                 try:
@@ -790,12 +791,12 @@ class MainWindow(QMainWindow):
         self.infer_scale = QComboBox()
         self.infer_scale.addItems(["0.25", "0.50", "0.75", "1.00"])
         self.infer_scale.setCurrentText(DEFAULT_SETTINGS["infer_scale"])
-        self.frame_stride = QSpinBox()
-        self.frame_stride.setRange(1, 30)
-        self.frame_stride.setValue(DEFAULT_SETTINGS["frame_stride"])
+        self.skip_frames = QSpinBox()
+        self.skip_frames.setRange(0, 30)
+        self.skip_frames.setValue(DEFAULT_SETTINGS["skip_frames"])
         self.reset_hyperparams_button = QPushButton("Reset Hyperparameters")
         realtime_form.addRow("Inference scale", self.infer_scale)
-        realtime_form.addRow("Process every N frames", self.frame_stride)
+        realtime_form.addRow("Skip frames", self.skip_frames)
         realtime_form.addRow(self.reset_hyperparams_button)
         controls.addWidget(realtime_box)
 
@@ -876,7 +877,7 @@ class MainWindow(QMainWindow):
             self.prompt,
             self.mode,
             self.infer_scale,
-            self.frame_stride,
+            self.skip_frames,
             self.blur_kernel,
         ]:
             if isinstance(widget, QLineEdit):
@@ -910,7 +911,7 @@ class MainWindow(QMainWindow):
             threshold=self.threshold.value() / 100.0,
             infer_scale=float(self.infer_scale.currentText()),
             blur_kernel=self.blur_kernel.value(),
-            frame_stride=self.frame_stride.value(),
+            skip_frames=self.skip_frames.value(),
         )
 
     def current_sweep_config(self) -> SweepConfig:
@@ -941,7 +942,7 @@ class MainWindow(QMainWindow):
         self.sweep_scales.setText(DEFAULT_SETTINGS["sweep_scales"])
         self.sweep_thresholds.setText(DEFAULT_SETTINGS["sweep_thresholds"])
         self.blur_kernel.setValue(DEFAULT_SETTINGS["blur_kernel"])
-        self.frame_stride.setValue(DEFAULT_SETTINGS["frame_stride"])
+        self.skip_frames.setValue(DEFAULT_SETTINGS["skip_frames"])
         self.benchmark_frames.setValue(DEFAULT_SETTINGS["benchmark_frames"])
         self.update_sweep_estimate()
         self.push_settings()
