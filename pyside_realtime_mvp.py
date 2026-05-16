@@ -392,6 +392,7 @@ class BenchmarkWorker(QThread):
     finished_with_results = Signal(list)
     row_ready = Signal(dict)
     progress = Signal(int, int, str)
+    preview = Signal(QImage, QImage)
     status = Signal(str)
 
     def __init__(self, segmenter: PromptSegmenter, settings: RuntimeSettings, max_frames: int) -> None:
@@ -439,12 +440,16 @@ class BenchmarkWorker(QThread):
                 tp_total = fp_total = tn_total = fn_total = 0
                 latencies = []
                 started = time.perf_counter()
-                for frame, gt_mask in zip(frames, gt_masks):
+                preview_step = max(1, len(frames) // 5)
+                for frame_offset, (frame, gt_mask) in enumerate(zip(frames, gt_masks)):
                     mask, model_latency_ms = self.segmenter.predict_mask(
                         frame,
                         self.settings.prompt,
                         infer_width,
                     )
+                    if frame_offset % preview_step == 0 or frame_offset == len(frames) - 1:
+                        output = apply_effect(frame, mask, threshold, self.settings.mode, self.settings.blur_kernel)
+                        self.preview.emit(bgr_to_qimage(frame), bgr_to_qimage(output))
                     latencies.append(model_latency_ms)
                     tp, fp, tn, fn = binary_confusion_counts(mask >= threshold, gt_mask)
                     tp_total += tp
@@ -944,6 +949,7 @@ class MainWindow(QMainWindow):
         )
         self.benchmark_worker.row_ready.connect(self.append_benchmark_row)
         self.benchmark_worker.progress.connect(self.update_benchmark_progress)
+        self.benchmark_worker.preview.connect(self.update_benchmark_preview)
         self.benchmark_worker.finished_with_results.connect(self.populate_benchmark)
         self.benchmark_worker.status.connect(self.set_status)
         self.benchmark_worker.finished.connect(lambda: self.benchmark_button.setEnabled(True))
@@ -977,6 +983,11 @@ class MainWindow(QMainWindow):
         self.benchmark_progress.setRange(0, total)
         self.benchmark_progress.setValue(current - 1)
         self.benchmark_progress_label.setText(f"running {current}/{total}: {label}")
+
+    @Slot(QImage, QImage)
+    def update_benchmark_preview(self, input_image: QImage, output_image: QImage) -> None:
+        self.input_pane.set_image(input_image)
+        self.output_pane.set_image(output_image)
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         self.stop_worker()
