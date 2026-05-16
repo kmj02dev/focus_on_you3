@@ -43,7 +43,8 @@ It supports:
 
 - camera start/stop
 - video play/pause/stop/seek
-- editable model selector
+- editable CLIPSeg and YOLO-World model selectors
+- backend selector for `CLIPSeg mask` and `YOLO-World box`
 - prompt-based target preservation
 - non-target blur/remove/dim/mask preview
 - live FPS and latency metrics
@@ -51,6 +52,13 @@ It supports:
 - CamVid GT benchmark sweep with visible progress and every-frame preview
 
 Live playback uses a split pipeline: one worker captures camera/video frames and another worker runs inference on the latest available frame. This keeps input playback responsive even when model inference is slower than the capture rate.
+
+Backends:
+
+- `CLIPSeg mask`: text prompt to soft segmentation mask. This gives pixel-level masks, but is typically slower on the current hardware.
+- `YOLO-World box`: open-vocabulary prompt to detection boxes, then uses the boxes as the preserved target mask. This is a faster real-time candidate, but its mask is box-shaped rather than pixel-accurate. Use comma-separated class names such as `person, car` for multiple targets.
+
+The YOLO-World backend uses `ultralytics` and defaults to `yolov8s-world.pt`. The first YOLO-World inference may download the model weights.
 
 In the GT benchmark controls, `Frames = All` uses every available benchmark frame.
 

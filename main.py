@@ -61,11 +61,14 @@ except ImportError as exc:  # pragma: no cover - only used when dependency is mi
 
 
 MODEL_NAME = "CIDAS/clipseg-rd64-refined"
+YOLO_WORLD_MODEL = "yolov8s-world.pt"
+YOLOWorld = None
 CAMVID_VIDEO = Path("benchmark_data/camvid_road_0001TP.mp4")
 CAMVID_GT_DIR = Path("benchmark_gt/camvid_road_0001TP")
 
 DEFAULT_SETTINGS = {
     "prompt": "road",
+    "backend": "CLIPSeg mask",
     "mode": "blur",
     "threshold": 50,
     "infer_scale": "0.50",
@@ -80,6 +83,7 @@ DEFAULT_SETTINGS = {
 @dataclass
 class RuntimeSettings:
     prompt: str = "road"
+    backend: str = "CLIPSeg mask"
     mode: str = "blur"
     threshold: float = 0.5
     infer_scale: float = 0.5
@@ -156,6 +160,17 @@ def default_device() -> str:
     return "cpu"
 
 
+def get_yolo_world_cls():
+    global YOLOWorld
+    if YOLOWorld is None:
+        try:
+            from ultralytics import YOLOWorld as YOLOWorldClass
+        except ImportError as exc:  # pragma: no cover - optional backend.
+            raise RuntimeError("YOLO-World backend requires ultralytics. Install it with: pip install ultralytics") from exc
+        YOLOWorld = YOLOWorldClass
+    return YOLOWorld
+
+
 def bgr_to_qimage(frame: np.ndarray) -> QImage:
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     height, width, channels = rgb.shape
@@ -229,6 +244,9 @@ class PromptSegmenter:
         self.device = torch.device(device)
         self.processor: CLIPSegProcessor | None = None
         self.model: CLIPSegForImageSegmentation | None = None
+        self.yolo_model_name = YOLO_WORLD_MODEL
+        self.yolo_model = None
+        self.yolo_classes: list[str] | None = None
         self.lock = threading.Lock()
 
     def load(self) -> None:
@@ -243,6 +261,18 @@ class PromptSegmenter:
             if self.device.type == "cuda":
                 torch.backends.cudnn.benchmark = True
 
+    def load_yolo_world(self, prompt: str) -> None:
+        classes = [item.strip() for item in prompt.split(",") if item.strip()]
+        if not classes:
+            raise ValueError("YOLO-World prompt must contain at least one class name")
+        yolo_world_cls = get_yolo_world_cls()
+        with self.lock:
+            if self.yolo_model is None:
+                self.yolo_model = yolo_world_cls(self.yolo_model_name)
+            if self.yolo_classes != classes:
+                self.yolo_model.set_classes(classes)
+                self.yolo_classes = classes
+
     def set_model(self, model_name: str, device: str) -> None:
         model_name = model_name.strip()
         if not model_name:
@@ -250,10 +280,21 @@ class PromptSegmenter:
         with self.lock:
             self.processor = None
             self.model = None
+            self.yolo_model = None
+            self.yolo_classes = None
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
             self.model_name = model_name
             self.device = torch.device(device)
+
+    def set_yolo_model(self, model_name: str) -> None:
+        model_name = model_name.strip()
+        if not model_name:
+            raise ValueError("YOLO model name cannot be empty")
+        with self.lock:
+            self.yolo_model = None
+            self.yolo_classes = None
+            self.yolo_model_name = model_name
 
     @torch.inference_mode()
     def predict_mask(self, frame: np.ndarray, prompt: str, infer_scale: float) -> tuple[np.ndarray, float]:
@@ -291,6 +332,54 @@ class PromptSegmenter:
         )
         mask = torch.sigmoid(upsampled)[0, 0].detach().float().cpu().numpy()
         return mask.astype(np.float32), model_latency_ms
+
+    @torch.inference_mode()
+    def predict_yolo_world_mask(self, frame: np.ndarray, prompt: str, infer_scale: float) -> tuple[np.ndarray, float]:
+        self.load_yolo_world(prompt)
+        assert self.yolo_model is not None
+
+        height, width = frame.shape[:2]
+        scale = min(1.0, max(0.05, infer_scale))
+        if scale < 1.0:
+            resized = cv2.resize(frame, (round(width * scale), round(height * scale)), interpolation=cv2.INTER_AREA)
+        else:
+            resized = frame
+
+        image_size = max(resized.shape[:2])
+        started = time.perf_counter()
+        results = self.yolo_model.predict(
+            resized,
+            imgsz=image_size,
+            device=str(self.device),
+            verbose=False,
+        )
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        model_latency_ms = (time.perf_counter() - started) * 1000.0
+
+        mask = np.zeros((height, width), dtype=np.float32)
+        if not results:
+            return mask, model_latency_ms
+        boxes = results[0].boxes
+        if boxes is None or boxes.xyxy is None:
+            return mask, model_latency_ms
+
+        xyxy = boxes.xyxy.detach().cpu().numpy()
+        if scale < 1.0:
+            xyxy = xyxy / scale
+        for x1, y1, x2, y2 in xyxy:
+            left = max(0, min(width, int(round(x1))))
+            top = max(0, min(height, int(round(y1))))
+            right = max(0, min(width, int(round(x2))))
+            bottom = max(0, min(height, int(round(y2))))
+            if right > left and bottom > top:
+                mask[top:bottom, left:right] = 1.0
+        return mask, model_latency_ms
+
+    def predict(self, frame: np.ndarray, prompt: str, infer_scale: float, backend: str) -> tuple[np.ndarray, float]:
+        if backend == "YOLO-World box":
+            return self.predict_yolo_world_mask(frame, prompt, infer_scale)
+        return self.predict_mask(frame, prompt, infer_scale)
 
 
 class CaptureWorker(QThread):
@@ -420,10 +509,11 @@ class InferenceWorker(QThread):
             if should_process and settings.prompt.strip():
                 started = time.perf_counter()
                 try:
-                    mask, model_latency_ms = self.segmenter.predict_mask(
+                    mask, model_latency_ms = self.segmenter.predict(
                         captured.frame,
                         settings.prompt.strip(),
                         settings.infer_scale,
+                        settings.backend,
                     )
                     output = apply_effect(
                         captured.frame,
@@ -479,10 +569,11 @@ class SweepWorker(QThread):
             for infer_scale in self.sweep_config.scales:
                 for threshold in self.sweep_config.thresholds:
                     started = time.perf_counter()
-                    mask, model_latency_ms = self.segmenter.predict_mask(
+                    mask, model_latency_ms = self.segmenter.predict(
                         self.frame,
                         self.settings.prompt,
                         infer_scale,
+                        self.settings.backend,
                     )
                     _ = apply_effect(self.frame, mask, threshold, self.settings.mode, self.settings.blur_kernel)
                     total_ms = (time.perf_counter() - started) * 1000.0
@@ -564,10 +655,11 @@ class BenchmarkWorker(QThread):
                 latencies = []
                 started = time.perf_counter()
                 for frame_offset, (frame, gt_mask) in enumerate(zip(frames, gt_masks)):
-                    mask, model_latency_ms = self.segmenter.predict_mask(
+                    mask, model_latency_ms = self.segmenter.predict(
                         frame,
                         self.settings.prompt,
                         infer_scale,
+                        self.settings.backend,
                     )
                     output = apply_effect(frame, mask, threshold, self.settings.mode, self.settings.blur_kernel)
                     self.preview.emit(bgr_to_qimage(frame), bgr_to_qimage(output))
@@ -713,6 +805,15 @@ class MainWindow(QMainWindow):
             ]
         )
         self.model_name.setCurrentText(self.segmenter.model_name)
+        self.yolo_model_name = QComboBox()
+        self.yolo_model_name.setEditable(True)
+        self.yolo_model_name.addItems(
+            [
+                YOLO_WORLD_MODEL,
+                "yolov8m-world.pt",
+            ]
+        )
+        self.yolo_model_name.setCurrentText(self.segmenter.yolo_model_name)
         self.device_name = QComboBox()
         devices = ["cpu"]
         if torch.cuda.is_available():
@@ -722,7 +823,8 @@ class MainWindow(QMainWindow):
         self.device_name.addItems(devices)
         self.device_name.setCurrentText(str(self.segmenter.device))
         self.apply_model_button = QPushButton("Apply Model")
-        model_form.addRow("Model ID", self.model_name)
+        model_form.addRow("CLIPSeg model ID", self.model_name)
+        model_form.addRow("YOLO-World model ID", self.yolo_model_name)
         model_form.addRow("Device", self.device_name)
         model_form.addRow(self.apply_model_button)
         controls.addWidget(model_box)
@@ -765,6 +867,9 @@ class MainWindow(QMainWindow):
 
         prompt_box = QGroupBox("Prompt & Effect")
         prompt_form = QFormLayout(prompt_box)
+        self.backend = QComboBox()
+        self.backend.addItems(["CLIPSeg mask", "YOLO-World box"])
+        self.backend.setCurrentText(DEFAULT_SETTINGS["backend"])
         self.prompt = QLineEdit(DEFAULT_SETTINGS["prompt"])
         self.mode = QComboBox()
         self.mode.addItems(["blur", "remove", "dim", "mask"])
@@ -779,6 +884,7 @@ class MainWindow(QMainWindow):
         self.blur_kernel.setRange(3, 99)
         self.blur_kernel.setSingleStep(2)
         self.blur_kernel.setValue(DEFAULT_SETTINGS["blur_kernel"])
+        prompt_form.addRow("Backend", self.backend)
         prompt_form.addRow("Target prompt", self.prompt)
         prompt_form.addRow("Mode", self.mode)
         prompt_form.addRow("Threshold", threshold_row)
@@ -873,6 +979,7 @@ class MainWindow(QMainWindow):
         self.sweep_thresholds.textChanged.connect(self.update_sweep_estimate)
         self.benchmark_frames.valueChanged.connect(self.update_sweep_estimate)
         for widget in [
+            self.backend,
             self.prompt,
             self.mode,
             self.infer_scale,
@@ -906,6 +1013,7 @@ class MainWindow(QMainWindow):
     def current_settings(self) -> RuntimeSettings:
         return RuntimeSettings(
             prompt=self.prompt.text().strip() or "target",
+            backend=self.backend.currentText(),
             mode=self.mode.currentText(),
             threshold=self.threshold.value() / 100.0,
             infer_scale=float(self.infer_scale.currentText()),
@@ -934,6 +1042,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def reset_hyperparameters(self) -> None:
+        self.backend.setCurrentText(DEFAULT_SETTINGS["backend"])
         self.prompt.setText(DEFAULT_SETTINGS["prompt"])
         self.mode.setCurrentText(DEFAULT_SETTINGS["mode"])
         self.threshold.setValue(DEFAULT_SETTINGS["threshold"])
@@ -968,11 +1077,14 @@ class MainWindow(QMainWindow):
         self.stop_worker()
         try:
             self.segmenter.set_model(self.model_name.currentText(), self.device_name.currentText())
+            self.segmenter.set_yolo_model(self.yolo_model_name.currentText())
         except Exception as exc:
             QMessageBox.warning(self, "Model switch failed", str(exc))
             return
         self.set_status(
-            f"Model set to {self.segmenter.model_name} on {self.segmenter.device}. "
+            f"CLIPSeg set to {self.segmenter.model_name}; "
+            f"YOLO-World set to {self.segmenter.yolo_model_name}; "
+            f"device: {self.segmenter.device}. "
             "It will load on the next inference."
         )
 
