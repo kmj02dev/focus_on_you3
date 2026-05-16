@@ -51,7 +51,7 @@ It supports:
 - optimization sweep on the current frame
 - CamVid GT benchmark sweep with visible progress and every-frame preview
 
-Live playback uses a split pipeline: one worker captures camera/video frames and another worker runs inference on the latest available frame. This keeps input playback responsive even when model inference is slower than the capture rate.
+Live playback uses a split pipeline: one worker captures camera/video frames and another worker runs inference on the latest available frame. This keeps input playback responsive even when model inference is slower than the capture rate. The left and right panes render from the same current source frame; the right `Processed` pane applies the latest available asynchronous mask with a target overlay.
 
 Backends:
 

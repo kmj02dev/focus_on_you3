@@ -4,6 +4,7 @@ __pycache__/
 # Generated outputs and downloaded datasets
 outputs/
 datasets/
+*.pt
 
 # Local environment files
 .env

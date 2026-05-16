@@ -121,13 +121,20 @@ class CapturedFrame:
     sequence: int
 
 
+@dataclass
+class MaskResult:
+    mask: np.ndarray
+    frame_shape: tuple[int, int]
+    sequence: int
+
+
 class LatestFrameBuffer:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.latest: CapturedFrame | None = None
         self.sequence = 0
 
-    def update(self, frame: np.ndarray, frame_index: int, total_frames: int) -> None:
+    def update(self, frame: np.ndarray, frame_index: int, total_frames: int) -> CapturedFrame:
         with self.lock:
             self.sequence += 1
             self.latest = CapturedFrame(
@@ -136,6 +143,13 @@ class LatestFrameBuffer:
                 total_frames=total_frames,
                 captured_at=time.perf_counter(),
                 sequence=self.sequence,
+            )
+            return CapturedFrame(
+                frame=self.latest.frame.copy(),
+                frame_index=self.latest.frame_index,
+                total_frames=self.latest.total_frames,
+                captured_at=self.latest.captured_at,
+                sequence=self.latest.sequence,
             )
 
     def get_latest(self) -> CapturedFrame | None:
@@ -209,6 +223,27 @@ def apply_effect(frame: np.ndarray, mask: np.ndarray, threshold: float, mode: st
         kernel = max(3, int(blur_kernel) | 1)
         background = cv2.GaussianBlur(frame, (kernel, kernel), 0)
     return np.where(binary[..., None], frame, background)
+
+
+def resize_mask_to_frame(mask: np.ndarray, frame: np.ndarray) -> np.ndarray:
+    height, width = frame.shape[:2]
+    if mask.shape[:2] == (height, width):
+        return mask
+    return cv2.resize(mask, (width, height), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+
+
+def apply_mask_overlay(frame: np.ndarray, mask: np.ndarray, threshold: float, mode: str, blur_kernel: int) -> np.ndarray:
+    resized_mask = resize_mask_to_frame(mask, frame)
+    output = apply_effect(frame, resized_mask, threshold, mode, blur_kernel)
+    if mode == "mask":
+        return output
+
+    alpha = np.clip(resized_mask, 0.0, 1.0) * 0.35
+    binary = resized_mask >= threshold
+    overlay = output.copy()
+    overlay[binary] = (40, 220, 120)
+    blended = output.astype(np.float32) * (1.0 - alpha[..., None]) + overlay.astype(np.float32) * alpha[..., None]
+    return np.clip(blended, 0, 255).astype(np.uint8)
 
 
 def binary_confusion_counts(prediction: np.ndarray, target: np.ndarray) -> tuple[int, int, int, int]:
@@ -383,7 +418,7 @@ class PromptSegmenter:
 
 
 class CaptureWorker(QThread):
-    input_frame = Signal(QImage)
+    display_frame = Signal(object)
     status = Signal(str)
     position_changed = Signal(int, int)
     video_info = Signal(int, float)
@@ -452,8 +487,8 @@ class CaptureWorker(QThread):
             if not ok:
                 break
 
-            self.frame_buffer.update(frame, frame_index, total_frames)
-            self.input_frame.emit(bgr_to_qimage(frame))
+            captured = self.frame_buffer.update(frame, frame_index, total_frames)
+            self.display_frame.emit(captured)
             self.position_changed.emit(frame_index, total_frames)
             frame_index += 1
 
@@ -468,7 +503,7 @@ class CaptureWorker(QThread):
 
 
 class InferenceWorker(QThread):
-    output_frame = Signal(QImage)
+    mask_result = Signal(object)
     metrics = Signal(object)
     status = Signal(str)
 
@@ -515,15 +550,14 @@ class InferenceWorker(QThread):
                         settings.infer_scale,
                         settings.backend,
                     )
-                    output = apply_effect(
-                        captured.frame,
-                        mask,
-                        settings.threshold,
-                        settings.mode,
-                        settings.blur_kernel,
-                    )
                     processed += 1
-                    self.output_frame.emit(bgr_to_qimage(output))
+                    self.mask_result.emit(
+                        MaskResult(
+                            mask=mask,
+                            frame_shape=captured.frame.shape[:2],
+                            sequence=captured.sequence,
+                        )
+                    )
                     now = time.perf_counter()
                     fps = 1.0 / max(1e-6, now - last_emit)
                     last_emit = now
@@ -732,6 +766,8 @@ class MainWindow(QMainWindow):
         self.active_source: int | str | None = None
         self.sweep_worker: SweepWorker | None = None
         self.benchmark_worker: BenchmarkWorker | None = None
+        self.latest_display_frame: np.ndarray | None = None
+        self.latest_mask_result: MaskResult | None = None
 
         self.setWindowTitle("Focus On You - Real-time Prompt Segmentation MVP")
         self.resize(1360, 860)
@@ -1060,6 +1096,7 @@ class MainWindow(QMainWindow):
     def push_settings(self, *args) -> None:  # type: ignore[no-untyped-def]
         if self.inference_worker is not None:
             self.inference_worker.configure(self.current_settings())
+        self.render_processed_pane()
 
     @Slot(int)
     def on_threshold_changed(self, value: int) -> None:
@@ -1097,17 +1134,19 @@ class MainWindow(QMainWindow):
     def start_source(self, source: int | str) -> None:
         self.stop_worker()
         self.active_source = source
+        self.latest_display_frame = None
+        self.latest_mask_result = None
         self.frame_buffer = LatestFrameBuffer()
         self.capture_worker = CaptureWorker(self.frame_buffer)
         self.inference_worker = InferenceWorker(self.segmenter, self.frame_buffer)
         self.capture_worker.set_source(source)
         self.inference_worker.configure(self.current_settings())
-        self.capture_worker.input_frame.connect(self.input_pane.set_image)
+        self.capture_worker.display_frame.connect(self.update_live_frame)
         self.capture_worker.status.connect(self.set_status)
         self.capture_worker.video_info.connect(self.update_video_info)
         self.capture_worker.position_changed.connect(self.update_video_position)
         self.capture_worker.finished.connect(self.handle_capture_finished)
-        self.inference_worker.output_frame.connect(self.output_pane.set_image)
+        self.inference_worker.mask_result.connect(self.update_mask_result)
         self.inference_worker.metrics.connect(self.update_metrics)
         self.inference_worker.status.connect(self.set_status)
         self.capture_worker.start()
@@ -1192,6 +1231,8 @@ class MainWindow(QMainWindow):
         self.inference_worker = None
         self.active_source = None
         self.frame_buffer = None
+        self.latest_display_frame = None
+        self.latest_mask_result = None
 
     @Slot()
     def handle_capture_finished(self) -> None:
@@ -1202,6 +1243,33 @@ class MainWindow(QMainWindow):
         self.capture_worker = None
         self.active_source = None
         self.frame_buffer = None
+
+    @Slot(object)
+    def update_live_frame(self, captured: CapturedFrame) -> None:
+        self.latest_display_frame = captured.frame
+        self.input_pane.set_image(bgr_to_qimage(captured.frame))
+        self.render_processed_pane()
+
+    @Slot(object)
+    def update_mask_result(self, result: MaskResult) -> None:
+        self.latest_mask_result = result
+        self.render_processed_pane()
+
+    def render_processed_pane(self) -> None:
+        if self.latest_display_frame is None:
+            return
+        settings = self.current_settings()
+        if self.latest_mask_result is None:
+            output = self.latest_display_frame
+        else:
+            output = apply_mask_overlay(
+                self.latest_display_frame,
+                self.latest_mask_result.mask,
+                settings.threshold,
+                settings.mode,
+                settings.blur_kernel,
+            )
+        self.output_pane.set_image(bgr_to_qimage(output))
 
     @Slot(object)
     def update_metrics(self, metrics: FrameMetrics) -> None:
