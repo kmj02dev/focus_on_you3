@@ -5,7 +5,7 @@ Install:
     pip install -r requirements.txt
 
 Run:
-    python pyside_realtime_mvp.py
+    python main.py
 
 The MVP keeps all application code in this file. It supports camera/video input,
 text-prompted segmentation, non-target blur/removal, live FPS/latency metrics,
@@ -404,7 +404,7 @@ class BenchmarkWorker(QThread):
     def run(self) -> None:
         try:
             if not CAMVID_VIDEO.exists() or not CAMVID_GT_DIR.exists():
-                raise RuntimeError("CamVid benchmark files not found. Run prepare_camvid_benchmark.py first.")
+                raise RuntimeError("CamVid benchmark files not found. Run benchmark/prepare_camvid_benchmark.py first.")
 
             frames: list[np.ndarray] = []
             gt_masks: list[np.ndarray] = []

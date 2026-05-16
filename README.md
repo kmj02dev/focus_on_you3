@@ -1,31 +1,8 @@
-# Text-Prompted Segmentation
+# Focus On You
 
-This project segments every supported image and video under `data/` using a text prompt, then writes masks and visualizations to `outputs/`.
+Real-time prompt-based video filtering MVP.
 
-## Usage
-
-```bash
-python segment_prompt.py "person"
-```
-
-Useful options:
-
-```bash
-python segment_prompt.py "car" --threshold 0.45 --frame-stride 2
-```
-
-To calculate the core GT-based metrics, provide ground-truth masks:
-
-```bash
-python segment_prompt.py "person" --gt-dir gt
-```
-
-- Image masks can be named like `gt/sample_input.png` or `gt/sample_input_mask.png`.
-- Video frame masks can be named like `gt/opencv_vtest/frame_000000_mask.png`.
-
-- Image outputs are saved under `outputs/images/<file_stem>/`.
-- Video outputs are saved under `outputs/videos/<file_stem>/`.
-- `outputs/summary.json` records processed files, prompt, non-target leakage, target damage, FPS, latency, mIoU, confusion counts, mask scores, and output paths.
+The app lets you enter a text prompt while using a camera or watching a video, then preserves the prompted target and blurs, removes, dims, or previews the non-target pixels.
 
 Core metrics:
 
@@ -34,25 +11,45 @@ Core metrics:
 - `FPS`
 - `latency_ms`
 
-The default model is `CIDAS/clipseg-rd64-refined`, which performs text-conditioned segmentation with CLIPSeg.
-
-## Real-time Desktop MVP
-
-Run the PySide6 single-file MVP:
+## Run
 
 ```bash
-python pyside_realtime_mvp.py
+pip install -r requirements.txt
+python main.py
 ```
 
-The app supports camera/video input, separate camera start/stop controls, video play/pause/stop/seek controls, prompt-based target preservation, non-target blur/removal, live FPS/latency, per-frame optimization sweep, and CamVid GT benchmark metrics with visible sweep progress and every-frame benchmark previews.
-The model selector is editable, so you can switch between the bundled CLIPSeg presets or type another compatible Hugging Face model ID.
+## Desktop MVP
+
+The PySide6 app is implemented in a single file:
+
+```text
+main.py
+```
+
+It supports:
+
+- camera start/stop
+- video play/pause/stop/seek
+- editable model selector
+- prompt-based target preservation
+- non-target blur/remove/dim/mask preview
+- live FPS and latency metrics
+- optimization sweep on the current frame
+- CamVid GT benchmark sweep with visible progress and every-frame preview
 
 ## CamVid Benchmark
 
-CamVid can be prepared as a small video-style benchmark with binary GT masks:
+The benchmark helper lives under `benchmark/`:
 
 ```bash
 git clone --depth 1 https://github.com/lih627/CamVid.git datasets/CamVid
-python prepare_camvid_benchmark.py --class-name road --frames 30
-python segment_prompt.py "road" --data-dir benchmark_data --gt-dir benchmark_gt --output-dir outputs/camvid_benchmark
+python benchmark/prepare_camvid_benchmark.py --class-name road --frames 30 --width 480
+python main.py
 ```
+
+The helper generates:
+
+- `benchmark_data/camvid_road_0001TP.mp4`
+- `benchmark_gt/camvid_road_0001TP/`
+
+These files are used by the app's `Run CamVid Road Benchmark` button.
