@@ -16,6 +16,7 @@ benchmark_gt/ are present.
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 import threading
 import time
@@ -718,6 +719,7 @@ class MainWindow(QMainWindow):
         self.active_source: int | str | None = None
         self.sweep_worker: SweepWorker | None = None
         self.benchmark_worker: BenchmarkWorker | None = None
+        self.latest_benchmark_results: list[dict] = []
 
         self.setWindowTitle("Focus On You - Real-time Prompt Segmentation MVP")
         self.resize(1360, 860)
@@ -906,6 +908,8 @@ class MainWindow(QMainWindow):
         self.benchmark_frames.setValue(DEFAULT_SETTINGS["benchmark_frames"])
         self.benchmark_frames.setSpecialValueText("All")
         self.benchmark_button = QPushButton("Run CamVid Road Benchmark")
+        self.save_benchmark_button = QPushButton("Save result")
+        self.save_benchmark_button.setEnabled(False)
         self.benchmark_progress = QProgressBar()
         self.benchmark_progress.setRange(0, 12)
         self.benchmark_progress.setValue(0)
@@ -917,8 +921,11 @@ class MainWindow(QMainWindow):
         self.benchmark_table.setMaximumHeight(210)
         benchmark_form = QFormLayout()
         benchmark_form.addRow("Frames", self.benchmark_frames)
+        benchmark_button_row = QHBoxLayout()
+        benchmark_button_row.addWidget(self.benchmark_button)
+        benchmark_button_row.addWidget(self.save_benchmark_button)
         benchmark_layout.addLayout(benchmark_form)
-        benchmark_layout.addWidget(self.benchmark_button)
+        benchmark_layout.addLayout(benchmark_button_row)
         benchmark_layout.addWidget(self.benchmark_progress)
         benchmark_layout.addWidget(self.benchmark_progress_label)
         benchmark_layout.addWidget(self.benchmark_table)
@@ -947,6 +954,7 @@ class MainWindow(QMainWindow):
         self.reset_hyperparams_button.clicked.connect(self.reset_hyperparameters)
         self.sweep_button.clicked.connect(self.run_sweep)
         self.benchmark_button.clicked.connect(self.run_benchmark)
+        self.save_benchmark_button.clicked.connect(self.save_benchmark_results)
         self.sweep_scales.textChanged.connect(self.update_sweep_estimate)
         self.sweep_thresholds.textChanged.connect(self.update_sweep_estimate)
         self.benchmark_frames.valueChanged.connect(self.update_sweep_estimate)
@@ -1229,6 +1237,8 @@ class MainWindow(QMainWindow):
         self.stop_worker()
         self.video_position.setText("benchmark")
         self.benchmark_button.setEnabled(False)
+        self.save_benchmark_button.setEnabled(False)
+        self.latest_benchmark_results = []
         self.benchmark_table.setRowCount(0)
         self.benchmark_progress.setRange(0, sweep_config.combination_count)
         self.benchmark_progress.setValue(0)
@@ -1249,9 +1259,55 @@ class MainWindow(QMainWindow):
 
     @Slot(list)
     def populate_benchmark(self, rows: list[dict]) -> None:
+        self.latest_benchmark_results = rows
         self.benchmark_progress.setValue(self.benchmark_progress.maximum())
         self.benchmark_progress_label.setText(f"complete: {len(rows)} combinations")
+        self.save_benchmark_button.setEnabled(bool(rows))
         self.set_status("Benchmark complete")
+
+    @Slot()
+    def save_benchmark_results(self) -> None:
+        if not self.latest_benchmark_results:
+            QMessageBox.warning(self, "No benchmark results", "Run a benchmark before saving results.")
+            self.save_benchmark_button.setEnabled(False)
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save benchmark result",
+            str(Path.cwd() / "benchmark_result.csv"),
+            "CSV files (*.csv)",
+        )
+        if not path:
+            return
+
+        output_path = Path(path)
+        if output_path.suffix.lower() != ".csv":
+            output_path = output_path.with_suffix(".csv")
+
+        fieldnames = [
+            "infer_scale",
+            "threshold",
+            "non_target_leakage",
+            "target_damage",
+            "fps",
+            "latency_ms",
+            "tp",
+            "fp",
+            "tn",
+            "fn",
+        ]
+        try:
+            with output_path.open("w", newline="", encoding="utf-8") as csv_file:
+                writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in self.latest_benchmark_results:
+                    writer.writerow({field: row.get(field, "") for field in fieldnames})
+        except Exception as exc:
+            QMessageBox.warning(self, "Save failed", str(exc))
+            return
+
+        self.set_status(f"Benchmark result saved: {output_path}")
 
     @Slot(dict)
     def append_benchmark_row(self, row: dict) -> None:
