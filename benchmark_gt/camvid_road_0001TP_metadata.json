@@ -1,0 +1,225 @@
+{
+  "dataset": "CamVid",
+  "source": "https://github.com/lih627/CamVid",
+  "video_path": "benchmark_data/camvid_road_0001TP.mp4",
+  "gt_dir": "benchmark_gt",
+  "video_stem": "camvid_road_0001TP",
+  "class_name": "road",
+  "class_id": 3,
+  "frames": 30,
+  "fps": 10.0,
+  "width": 480,
+  "height": 360,
+  "frame_records": [
+    {
+      "frame": 0,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_008550.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_008550_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000000_mask.png",
+      "positive_ratio": 0.20766203703703703
+    },
+    {
+      "frame": 1,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_008580.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_008580_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000001_mask.png",
+      "positive_ratio": 0.19473958333333333
+    },
+    {
+      "frame": 2,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_008610.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_008610_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000002_mask.png",
+      "positive_ratio": 0.20671875
+    },
+    {
+      "frame": 3,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_008640.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_008640_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000003_mask.png",
+      "positive_ratio": 0.20482638888888888
+    },
+    {
+      "frame": 4,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_008670.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_008670_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000004_mask.png",
+      "positive_ratio": 0.21975694444444444
+    },
+    {
+      "frame": 5,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_008700.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_008700_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000005_mask.png",
+      "positive_ratio": 0.22721064814814815
+    },
+    {
+      "frame": 6,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_008730.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_008730_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000006_mask.png",
+      "positive_ratio": 0.21893518518518518
+    },
+    {
+      "frame": 7,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_008760.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_008760_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000007_mask.png",
+      "positive_ratio": 0.23984375
+    },
+    {
+      "frame": 8,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_008790.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_008790_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000008_mask.png",
+      "positive_ratio": 0.20476273148148147
+    },
+    {
+      "frame": 9,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_008820.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_008820_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000009_mask.png",
+      "positive_ratio": 0.18261574074074075
+    },
+    {
+      "frame": 10,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_008850.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_008850_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000010_mask.png",
+      "positive_ratio": 0.1718576388888889
+    },
+    {
+      "frame": 11,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_008880.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_008880_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000011_mask.png",
+      "positive_ratio": 0.15758680555555554
+    },
+    {
+      "frame": 12,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_008910.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_008910_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000012_mask.png",
+      "positive_ratio": 0.1462673611111111
+    },
+    {
+      "frame": 13,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_008940.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_008940_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000013_mask.png",
+      "positive_ratio": 0.13814814814814816
+    },
+    {
+      "frame": 14,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_008970.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_008970_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000014_mask.png",
+      "positive_ratio": 0.12303819444444444
+    },
+    {
+      "frame": 15,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_009000.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_009000_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000015_mask.png",
+      "positive_ratio": 0.12744791666666666
+    },
+    {
+      "frame": 16,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_009030.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_009030_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000016_mask.png",
+      "positive_ratio": 0.14700810185185184
+    },
+    {
+      "frame": 17,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_009060.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_009060_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000017_mask.png",
+      "positive_ratio": 0.15108217592592593
+    },
+    {
+      "frame": 18,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_009090.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_009090_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000018_mask.png",
+      "positive_ratio": 0.15622106481481482
+    },
+    {
+      "frame": 19,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_009120.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_009120_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000019_mask.png",
+      "positive_ratio": 0.13918402777777777
+    },
+    {
+      "frame": 20,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_009150.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_009150_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000020_mask.png",
+      "positive_ratio": 0.1277199074074074
+    },
+    {
+      "frame": 21,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_009180.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_009180_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000021_mask.png",
+      "positive_ratio": 0.08899305555555556
+    },
+    {
+      "frame": 22,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_009210.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_009210_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000022_mask.png",
+      "positive_ratio": 0.10607638888888889
+    },
+    {
+      "frame": 23,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_009240.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_009240_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000023_mask.png",
+      "positive_ratio": 0.07241898148148149
+    },
+    {
+      "frame": 24,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_009270.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_009270_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000024_mask.png",
+      "positive_ratio": 0.10374421296296296
+    },
+    {
+      "frame": 25,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_009300.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_009300_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000025_mask.png",
+      "positive_ratio": 0.10211226851851851
+    },
+    {
+      "frame": 26,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_009330.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_009330_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000026_mask.png",
+      "positive_ratio": 0.10536458333333333
+    },
+    {
+      "frame": 27,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_009360.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_009360_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000027_mask.png",
+      "positive_ratio": 0.10199652777777778
+    },
+    {
+      "frame": 28,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_009390.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_009390_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000028_mask.png",
+      "positive_ratio": 0.10263310185185186
+    },
+    {
+      "frame": 29,
+      "image": "datasets/CamVid/CamVid_RGB/0001TP_009420.png",
+      "label": "datasets/CamVid/CamVidGray/0001TP_009420_L.png",
+      "gt_mask": "benchmark_gt/camvid_road_0001TP/frame_000029_mask.png",
+      "positive_ratio": 0.10179976851851852
+    }
+  ]
+}

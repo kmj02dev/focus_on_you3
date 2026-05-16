@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+
+# Generated outputs and downloaded datasets
+outputs/
+datasets/
+
+# Local environment files
+.env
+.venv/
+venv/
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
