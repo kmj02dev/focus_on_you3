@@ -30,7 +30,7 @@ from PIL import Image
 from transformers import CLIPSegForImageSegmentation, CLIPSegProcessor
 
 try:
-    from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
+    from PySide6.QtCore import Qt, QThread, Signal, Slot
     from PySide6.QtGui import QAction, QImage, QPixmap
     from PySide6.QtWidgets import (
         QApplication,
@@ -46,7 +46,9 @@ try:
         QMessageBox,
         QProgressBar,
         QPushButton,
+        QScrollArea,
         QSlider,
+        QSizePolicy,
         QSpinBox,
         QTableWidget,
         QTableWidgetItem,
@@ -474,7 +476,8 @@ class ImagePane(QLabel):
     def __init__(self, title: str) -> None:
         super().__init__(title)
         self.setAlignment(Qt.AlignCenter)
-        self.setMinimumSize(420, 300)
+        self.setMinimumSize(320, 240)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setStyleSheet(
             "QLabel { background: #050608; color: #aab2c0; border: 1px solid #303541; }"
         )
@@ -510,7 +513,8 @@ class MainWindow(QMainWindow):
         self.benchmark_worker: BenchmarkWorker | None = None
 
         self.setWindowTitle("Focus On You - Real-time Prompt Segmentation MVP")
-        self.resize(1280, 780)
+        self.resize(1360, 860)
+        self.setMinimumSize(1040, 680)
         self._build_ui()
         self._connect_ui()
         self.apply_dark_theme()
@@ -519,9 +523,13 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         main = QHBoxLayout(root)
+        main.setContentsMargins(10, 10, 10, 10)
+        main.setSpacing(10)
 
         video_layout = QVBoxLayout()
+        video_layout.setSpacing(8)
         panes = QHBoxLayout()
+        panes.setSpacing(8)
         self.input_pane = ImagePane("Input")
         self.output_pane = ImagePane("Processed")
         panes.addWidget(self.input_pane, 1)
@@ -548,13 +556,21 @@ class MainWindow(QMainWindow):
             label.setAlignment(Qt.AlignCenter)
             label.setStyleSheet("font-size: 22px; font-weight: 700;")
             layout.addWidget(label)
-            metrics.addWidget(box, 0, i)
+            metrics.addWidget(box, i // 3, i % 3)
         video_layout.addLayout(metrics)
         main.addLayout(video_layout, 1)
 
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setMinimumWidth(390)
+        controls_scroll.setMaximumWidth(470)
+        controls_container = QWidget()
         controls = QVBoxLayout()
+        controls.setContentsMargins(6, 6, 6, 6)
         controls.setSpacing(12)
-        main.addLayout(controls)
+        controls_container.setLayout(controls)
+        controls_scroll.setWidget(controls_container)
+        main.addWidget(controls_scroll)
 
         model_box = QGroupBox("Model")
         model_form = QFormLayout(model_box)
@@ -661,6 +677,8 @@ class MainWindow(QMainWindow):
         self.sweep_button = QPushButton("Run Sweep On Current Frame")
         self.sweep_table = QTableWidget(0, 4)
         self.sweep_table.setHorizontalHeaderLabels(["width", "thr", "lat ms", "coverage"])
+        self.sweep_table.setMinimumHeight(120)
+        self.sweep_table.setMaximumHeight(170)
         sweep_layout.addWidget(self.sweep_button)
         sweep_layout.addWidget(self.sweep_table)
         controls.addWidget(sweep_box)
@@ -678,6 +696,8 @@ class MainWindow(QMainWindow):
         self.benchmark_progress_label = QLabel("idle")
         self.benchmark_table = QTableWidget(0, 6)
         self.benchmark_table.setHorizontalHeaderLabels(["width", "thr", "leak", "damage", "FPS", "lat ms"])
+        self.benchmark_table.setMinimumHeight(150)
+        self.benchmark_table.setMaximumHeight(210)
         benchmark_form = QFormLayout()
         benchmark_form.addRow("Frames", self.benchmark_frames)
         benchmark_layout.addLayout(benchmark_form)
