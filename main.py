@@ -69,6 +69,8 @@ DEFAULT_SETTINGS = {
     "mode": "blur",
     "threshold": 50,
     "infer_scale": "0.50",
+    "sweep_scales": "0.25,0.50,0.75,1.00",
+    "sweep_thresholds": "0.35,0.50,0.65",
     "blur_kernel": 35,
     "frame_stride": 1,
     "fps_cap": 15,
@@ -85,6 +87,16 @@ class RuntimeSettings:
     blur_kernel: int = 35
     frame_stride: int = 1
     fps_cap: int = 15
+
+
+@dataclass
+class SweepConfig:
+    scales: list[float]
+    thresholds: list[float]
+
+    @property
+    def combination_count(self) -> int:
+        return len(self.scales) * len(self.thresholds)
 
 
 @dataclass
@@ -111,6 +123,24 @@ def bgr_to_qimage(frame: np.ndarray) -> QImage:
     height, width, channels = rgb.shape
     bytes_per_line = channels * width
     return QImage(rgb.data, width, height, bytes_per_line, QImage.Format_RGB888).copy()
+
+
+def parse_float_csv(text: str, minimum: float, maximum: float, label: str) -> list[float]:
+    values: list[float] = []
+    for raw_item in text.split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        try:
+            value = float(item)
+        except ValueError as exc:
+            raise ValueError(f"{label} contains a non-number: {item!r}") from exc
+        if not minimum <= value <= maximum:
+            raise ValueError(f"{label} value {value:g} is outside [{minimum:g}, {maximum:g}]")
+        values.append(value)
+    if not values:
+        raise ValueError(f"{label} must contain at least one value")
+    return list(dict.fromkeys(values))
 
 
 def apply_effect(frame: np.ndarray, mask: np.ndarray, threshold: float, mode: str, blur_kernel: int) -> np.ndarray:
@@ -366,17 +396,24 @@ class SweepWorker(QThread):
     finished_with_results = Signal(list)
     status = Signal(str)
 
-    def __init__(self, segmenter: PromptSegmenter, frame: np.ndarray, settings: RuntimeSettings) -> None:
+    def __init__(
+        self,
+        segmenter: PromptSegmenter,
+        frame: np.ndarray,
+        settings: RuntimeSettings,
+        sweep_config: SweepConfig,
+    ) -> None:
         super().__init__()
         self.segmenter = segmenter
         self.frame = frame
         self.settings = settings
+        self.sweep_config = sweep_config
 
     def run(self) -> None:
         try:
             results = []
-            for infer_scale in [0.25, 0.50, 0.75, 1.00]:
-                for threshold in [0.35, 0.50, 0.65]:
+            for infer_scale in self.sweep_config.scales:
+                for threshold in self.sweep_config.thresholds:
                     started = time.perf_counter()
                     mask, model_latency_ms = self.segmenter.predict_mask(
                         self.frame,
@@ -406,11 +443,18 @@ class BenchmarkWorker(QThread):
     preview = Signal(QImage, QImage)
     status = Signal(str)
 
-    def __init__(self, segmenter: PromptSegmenter, settings: RuntimeSettings, max_frames: int) -> None:
+    def __init__(
+        self,
+        segmenter: PromptSegmenter,
+        settings: RuntimeSettings,
+        max_frames: int,
+        sweep_config: SweepConfig,
+    ) -> None:
         super().__init__()
         self.segmenter = segmenter
         self.settings = settings
         self.max_frames = max_frames
+        self.sweep_config = sweep_config
 
     def run(self) -> None:
         try:
@@ -440,7 +484,11 @@ class BenchmarkWorker(QThread):
                 raise RuntimeError("No benchmark frames with GT masks found")
 
             results = []
-            combinations = [(scale, threshold) for scale in [0.25, 0.50, 0.75, 1.00] for threshold in [0.35, 0.50, 0.65]]
+            combinations = [
+                (scale, threshold)
+                for scale in self.sweep_config.scales
+                for threshold in self.sweep_config.thresholds
+            ]
             total_combinations = len(combinations)
             for combo_index, (infer_scale, threshold) in enumerate(combinations, start=1):
                 self.progress.emit(
@@ -688,6 +736,17 @@ class MainWindow(QMainWindow):
         realtime_form.addRow(self.reset_hyperparams_button)
         controls.addWidget(realtime_box)
 
+        sweep_space_box = QGroupBox("Sweep Space")
+        sweep_space_form = QFormLayout(sweep_space_box)
+        self.sweep_scales = QLineEdit(DEFAULT_SETTINGS["sweep_scales"])
+        self.sweep_thresholds = QLineEdit(DEFAULT_SETTINGS["sweep_thresholds"])
+        self.sweep_estimate = QLabel("")
+        self.sweep_estimate.setWordWrap(True)
+        sweep_space_form.addRow("Scales CSV", self.sweep_scales)
+        sweep_space_form.addRow("Thresholds CSV", self.sweep_thresholds)
+        sweep_space_form.addRow("Combinations", self.sweep_estimate)
+        controls.addWidget(sweep_space_box)
+
         sweep_box = QGroupBox("Optimization Sweep")
         sweep_layout = QVBoxLayout(sweep_box)
         self.sweep_button = QPushButton("Run Sweep On Current Frame")
@@ -728,6 +787,7 @@ class MainWindow(QMainWindow):
         self.status_label.setWordWrap(True)
         controls.addWidget(self.status_label)
         controls.addStretch(1)
+        self.update_sweep_estimate()
 
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self.close)
@@ -746,6 +806,9 @@ class MainWindow(QMainWindow):
         self.reset_hyperparams_button.clicked.connect(self.reset_hyperparameters)
         self.sweep_button.clicked.connect(self.run_sweep)
         self.benchmark_button.clicked.connect(self.run_benchmark)
+        self.sweep_scales.textChanged.connect(self.update_sweep_estimate)
+        self.sweep_thresholds.textChanged.connect(self.update_sweep_estimate)
+        self.benchmark_frames.valueChanged.connect(self.update_sweep_estimate)
         for widget in [
             self.prompt,
             self.mode,
@@ -789,16 +852,38 @@ class MainWindow(QMainWindow):
             fps_cap=self.fps_cap.value(),
         )
 
+    def current_sweep_config(self) -> SweepConfig:
+        return SweepConfig(
+            scales=parse_float_csv(self.sweep_scales.text(), 0.05, 1.0, "scales"),
+            thresholds=parse_float_csv(self.sweep_thresholds.text(), 0.01, 0.99, "thresholds"),
+        )
+
+    @Slot()
+    def update_sweep_estimate(self, *args) -> None:  # type: ignore[no-untyped-def]
+        try:
+            config = self.current_sweep_config()
+        except ValueError as exc:
+            self.sweep_estimate.setText(str(exc))
+            return
+        frame_text = "all frames" if self.benchmark_frames.value() == 0 else f"{self.benchmark_frames.value()} frames"
+        self.sweep_estimate.setText(
+            f"{config.combination_count} combinations "
+            f"({len(config.scales)} scales x {len(config.thresholds)} thresholds), benchmark: {frame_text}"
+        )
+
     @Slot()
     def reset_hyperparameters(self) -> None:
         self.prompt.setText(DEFAULT_SETTINGS["prompt"])
         self.mode.setCurrentText(DEFAULT_SETTINGS["mode"])
         self.threshold.setValue(DEFAULT_SETTINGS["threshold"])
         self.infer_scale.setCurrentText(DEFAULT_SETTINGS["infer_scale"])
+        self.sweep_scales.setText(DEFAULT_SETTINGS["sweep_scales"])
+        self.sweep_thresholds.setText(DEFAULT_SETTINGS["sweep_thresholds"])
         self.blur_kernel.setValue(DEFAULT_SETTINGS["blur_kernel"])
         self.frame_stride.setValue(DEFAULT_SETTINGS["frame_stride"])
         self.fps_cap.setValue(DEFAULT_SETTINGS["fps_cap"])
         self.benchmark_frames.setValue(DEFAULT_SETTINGS["benchmark_frames"])
+        self.update_sweep_estimate()
         self.push_settings()
         self.set_status("Hyperparameters reset to defaults")
 
@@ -939,9 +1024,14 @@ class MainWindow(QMainWindow):
         if frame is None:
             QMessageBox.warning(self, "No frame", "Start a camera or video source first.")
             return
+        try:
+            sweep_config = self.current_sweep_config()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid sweep space", str(exc))
+            return
         self.sweep_button.setEnabled(False)
         self.sweep_table.setRowCount(0)
-        self.sweep_worker = SweepWorker(self.segmenter, frame, self.current_settings())
+        self.sweep_worker = SweepWorker(self.segmenter, frame, self.current_settings(), sweep_config)
         self.sweep_worker.finished_with_results.connect(self.populate_sweep)
         self.sweep_worker.status.connect(self.set_status)
         self.sweep_worker.finished.connect(lambda: self.sweep_button.setEnabled(True))
@@ -963,17 +1053,23 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def run_benchmark(self) -> None:
+        try:
+            sweep_config = self.current_sweep_config()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid sweep space", str(exc))
+            return
         self.stop_worker()
         self.video_position.setText("benchmark")
         self.benchmark_button.setEnabled(False)
         self.benchmark_table.setRowCount(0)
-        self.benchmark_progress.setRange(0, 12)
+        self.benchmark_progress.setRange(0, sweep_config.combination_count)
         self.benchmark_progress.setValue(0)
         self.benchmark_progress_label.setText("loading benchmark frames...")
         self.benchmark_worker = BenchmarkWorker(
             self.segmenter,
             self.current_settings(),
             self.benchmark_frames.value(),
+            sweep_config,
         )
         self.benchmark_worker.row_ready.connect(self.append_benchmark_row)
         self.benchmark_worker.progress.connect(self.update_benchmark_progress)

@@ -60,10 +60,12 @@ The main resolution hyperparameter is `scale`, not absolute width. `scale` contr
 
 Lower `scale` usually improves FPS and latency, but can increase `non_target_leakage` or `target_damage`. Higher `scale` usually improves mask quality, but costs more latency.
 
-The benchmark sweep currently tests:
+The sweep space is editable in the UI as comma-separated values:
 
-- `scale`: `0.25`, `0.50`, `0.75`, `1.00`
-- `threshold`: `0.35`, `0.50`, `0.65`
+- `Scales CSV`: default `0.25,0.50,0.75,1.00`
+- `Thresholds CSV`: default `0.35,0.50,0.65`
+
+The app shows the resulting combination count before running the current-frame sweep or CamVid benchmark.
 
 Use `Reset Hyperparameters` to restore the default prompt/effect/realtime/benchmark settings.
 
