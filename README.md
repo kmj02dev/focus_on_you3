@@ -81,9 +81,12 @@ The Backend dropdown exposes these user-facing pipelines:
 
 - `CLIPSeg`: text-to-mask baseline using `CIDAS/clipseg-rd64-refined`.
 - `YOLO-World small box-only`: open-vocabulary detection boxes converted to a binary mask.
+- `YOLO11n-seg`: COCO-class segmentation using `weights/yolo11n-seg.pt`. Useful prompts include `person`, `car`, `vehicle`, `dog`, `cat`, `animal`, `사람`, `자동차`, and `개`.
 - `YOLO-World small + SAM2 tiny tracking`: visible in the dropdown, but blocked until SAM2 tiny runtime/checkpoint is installed.
 - `SAM 3`: visible in the dropdown, but blocked until SAM 3 runtime/checkpoint is installed.
 - `Grounding DINO tiny + SAM2 tiny`: visible in the dropdown, but blocked until Grounding DINO and SAM2 tiny runtimes/checkpoints are installed.
+
+The Model panel always shows the currently applied backend/device. If a different backend is selected but `Apply Model` has not been pressed yet, it is shown as pending.
 
 Use `Reset Hyperparameters` to restore the default prompt/effect/realtime/benchmark settings.
 
