@@ -45,12 +45,13 @@ It supports:
 - video play/pause/stop/seek
 - editable model selector
 - prompt-based target preservation
-- non-target blur/remove/dim/mask preview
+- live effect preview on the same frame as the input feed
+- non-target blur/remove/dim/mask preview in sweeps and GT benchmark runs
 - live FPS and latency metrics
 - optimization sweep on the current frame
 - CamVid GT benchmark sweep with visible progress and every-frame preview
 
-Live playback uses a split pipeline: one worker captures camera/video frames and another worker runs inference on the latest available frame. This keeps input playback responsive even when model inference is slower than the capture rate.
+Live playback uses a split pipeline: one worker captures camera/video frames and another worker runs inference on the latest available frame. This keeps input playback responsive even when model inference is slower than the capture rate. During live playback, `Processed` shows the same video frame as `Input` with the latest model mask rendered as the selected blur/remove/dim/mask effect preview.
 
 In the GT benchmark controls, `Frames = All` uses every available benchmark frame.
 

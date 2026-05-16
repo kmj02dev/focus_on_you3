@@ -117,6 +117,15 @@ class CapturedFrame:
     sequence: int
 
 
+@dataclass
+class MaskSnapshot:
+    mask: np.ndarray
+    threshold: float
+    mode: str
+    blur_kernel: int
+    sequence: int
+
+
 class LatestFrameBuffer:
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -144,6 +153,45 @@ class LatestFrameBuffer:
                 frame_index=latest.frame_index,
                 total_frames=latest.total_frames,
                 captured_at=latest.captured_at,
+                sequence=latest.sequence,
+            )
+
+
+class LatestMaskBuffer:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.latest: MaskSnapshot | None = None
+        self.sequence = 0
+
+    def update(self, mask: np.ndarray, threshold: float, mode: str, blur_kernel: int) -> None:
+        with self.lock:
+            self.sequence += 1
+            self.latest = MaskSnapshot(
+                mask=mask.astype(np.float32, copy=True),
+                threshold=float(threshold),
+                mode=mode,
+                blur_kernel=int(blur_kernel),
+                sequence=self.sequence,
+            )
+
+    def set_visualization(self, threshold: float, mode: str, blur_kernel: int) -> None:
+        with self.lock:
+            if self.latest is None:
+                return
+            self.latest.threshold = float(threshold)
+            self.latest.mode = mode
+            self.latest.blur_kernel = int(blur_kernel)
+
+    def get_latest(self) -> MaskSnapshot | None:
+        with self.lock:
+            if self.latest is None:
+                return None
+            latest = self.latest
+            return MaskSnapshot(
+                mask=latest.mask.copy(),
+                threshold=latest.threshold,
+                mode=latest.mode,
+                blur_kernel=latest.blur_kernel,
                 sequence=latest.sequence,
             )
 
@@ -194,6 +242,19 @@ def apply_effect(frame: np.ndarray, mask: np.ndarray, threshold: float, mode: st
         kernel = max(3, int(blur_kernel) | 1)
         background = cv2.GaussianBlur(frame, (kernel, kernel), 0)
     return np.where(binary[..., None], frame, background)
+
+
+def overlay_effect_mask(
+    frame: np.ndarray,
+    mask: np.ndarray,
+    threshold: float,
+    mode: str,
+    blur_kernel: int,
+) -> np.ndarray:
+    height, width = frame.shape[:2]
+    if mask.shape[:2] != (height, width):
+        mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_LINEAR)
+    return apply_effect(frame, mask, threshold, mode, blur_kernel)
 
 
 def binary_confusion_counts(prediction: np.ndarray, target: np.ndarray) -> tuple[int, int, int, int]:
@@ -295,13 +356,15 @@ class PromptSegmenter:
 
 class CaptureWorker(QThread):
     input_frame = Signal(QImage)
+    output_frame = Signal(QImage)
     status = Signal(str)
     position_changed = Signal(int, int)
     video_info = Signal(int, float)
 
-    def __init__(self, frame_buffer: LatestFrameBuffer) -> None:
+    def __init__(self, frame_buffer: LatestFrameBuffer, mask_buffer: LatestMaskBuffer) -> None:
         super().__init__()
         self.frame_buffer = frame_buffer
+        self.mask_buffer = mask_buffer
         self.source: int | str = 0
         self.running = False
         self.paused = False
@@ -365,6 +428,21 @@ class CaptureWorker(QThread):
 
             self.frame_buffer.update(frame, frame_index, total_frames)
             self.input_frame.emit(bgr_to_qimage(frame))
+            mask_snapshot = self.mask_buffer.get_latest()
+            if mask_snapshot is None:
+                self.output_frame.emit(bgr_to_qimage(frame))
+            else:
+                self.output_frame.emit(
+                    bgr_to_qimage(
+                        overlay_effect_mask(
+                            frame,
+                            mask_snapshot.mask,
+                            mask_snapshot.threshold,
+                            mask_snapshot.mode,
+                            mask_snapshot.blur_kernel,
+                        )
+                    )
+                )
             self.position_changed.emit(frame_index, total_frames)
             frame_index += 1
 
@@ -379,14 +457,19 @@ class CaptureWorker(QThread):
 
 
 class InferenceWorker(QThread):
-    output_frame = Signal(QImage)
     metrics = Signal(object)
     status = Signal(str)
 
-    def __init__(self, segmenter: PromptSegmenter, frame_buffer: LatestFrameBuffer) -> None:
+    def __init__(
+        self,
+        segmenter: PromptSegmenter,
+        frame_buffer: LatestFrameBuffer,
+        mask_buffer: LatestMaskBuffer,
+    ) -> None:
         super().__init__()
         self.segmenter = segmenter
         self.frame_buffer = frame_buffer
+        self.mask_buffer = mask_buffer
         self.settings = RuntimeSettings()
         self.settings_lock = threading.Lock()
         self.running = False
@@ -426,15 +509,8 @@ class InferenceWorker(QThread):
                         settings.prompt.strip(),
                         settings.infer_scale,
                     )
-                    output = apply_effect(
-                        captured.frame,
-                        mask,
-                        settings.threshold,
-                        settings.mode,
-                        settings.blur_kernel,
-                    )
+                    self.mask_buffer.update(mask, settings.threshold, settings.mode, settings.blur_kernel)
                     processed += 1
-                    self.output_frame.emit(bgr_to_qimage(output))
                     now = time.perf_counter()
                     fps = 1.0 / max(1e-6, now - last_emit)
                     last_emit = now
@@ -636,6 +712,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.segmenter = segmenter
         self.frame_buffer: LatestFrameBuffer | None = None
+        self.mask_buffer: LatestMaskBuffer | None = None
         self.capture_worker: CaptureWorker | None = None
         self.inference_worker: InferenceWorker | None = None
         self.active_source: int | str | None = None
@@ -950,8 +1027,11 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def push_settings(self, *args) -> None:  # type: ignore[no-untyped-def]
+        settings = self.current_settings()
         if self.inference_worker is not None:
-            self.inference_worker.configure(self.current_settings())
+            self.inference_worker.configure(settings)
+        if self.mask_buffer is not None:
+            self.mask_buffer.set_visualization(settings.threshold, settings.mode, settings.blur_kernel)
 
     @Slot(int)
     def on_threshold_changed(self, value: int) -> None:
@@ -987,16 +1067,17 @@ class MainWindow(QMainWindow):
         self.stop_worker()
         self.active_source = source
         self.frame_buffer = LatestFrameBuffer()
-        self.capture_worker = CaptureWorker(self.frame_buffer)
-        self.inference_worker = InferenceWorker(self.segmenter, self.frame_buffer)
+        self.mask_buffer = LatestMaskBuffer()
+        self.capture_worker = CaptureWorker(self.frame_buffer, self.mask_buffer)
+        self.inference_worker = InferenceWorker(self.segmenter, self.frame_buffer, self.mask_buffer)
         self.capture_worker.set_source(source)
         self.inference_worker.configure(self.current_settings())
         self.capture_worker.input_frame.connect(self.input_pane.set_image)
+        self.capture_worker.output_frame.connect(self.output_pane.set_image)
         self.capture_worker.status.connect(self.set_status)
         self.capture_worker.video_info.connect(self.update_video_info)
         self.capture_worker.position_changed.connect(self.update_video_position)
         self.capture_worker.finished.connect(self.handle_capture_finished)
-        self.inference_worker.output_frame.connect(self.output_pane.set_image)
         self.inference_worker.metrics.connect(self.update_metrics)
         self.inference_worker.status.connect(self.set_status)
         self.capture_worker.start()
