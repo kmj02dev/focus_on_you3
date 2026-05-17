@@ -4,6 +4,7 @@ __pycache__/
 # Generated outputs and downloaded datasets
 outputs/
 datasets/
+*.pt
 weights/*.pt
 
 # Local environment files
@@ -15,3 +16,7 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# md
+*.md
+!README.md

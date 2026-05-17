@@ -90,6 +90,9 @@ YOLOWorld = None
 YOLO = None
 CAMVID_VIDEO = Path("benchmark_data/camvid_road_0001TP.mp4")
 CAMVID_GT_DIR = Path("benchmark_gt/camvid_road_0001TP")
+DISPLAY_MAX_DIMENSION = 960
+DISPLAY_FPS_LIMIT = 15.0
+POSITION_FPS_LIMIT = 10.0
 
 DEFAULT_SETTINGS = {
     "prompt": "road",
@@ -345,6 +348,17 @@ def bgr_to_qimage(frame: np.ndarray) -> QImage:
     height, width, channels = rgb.shape
     bytes_per_line = channels * width
     return QImage(rgb.data, width, height, bytes_per_line, QImage.Format_RGB888).copy()
+
+
+def resize_frame_for_display(frame: np.ndarray, max_dimension: int = DISPLAY_MAX_DIMENSION) -> np.ndarray:
+    height, width = frame.shape[:2]
+    largest = max(height, width)
+    if largest <= max_dimension:
+        return frame
+    scale = max_dimension / largest
+    resized_width = max(1, round(width * scale))
+    resized_height = max(1, round(height * scale))
+    return cv2.resize(frame, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
 
 
 def parse_float_csv(text: str, minimum: float, maximum: float, label: str) -> list[float]:
@@ -698,6 +712,7 @@ class CaptureWorker(QThread):
     def run(self) -> None:
         self.running = True
         cap = cv2.VideoCapture(self.source)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         with self.cap_lock:
             self.cap = cap
         if not cap.isOpened():
@@ -711,9 +726,10 @@ class CaptureWorker(QThread):
         frame_index = 0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if isinstance(self.source, str) else 0
         source_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
-        processed = 0
-        skipped = 0
-        last_emit = time.perf_counter()
+        display_interval = 1.0 / DISPLAY_FPS_LIMIT
+        position_interval = 1.0 / POSITION_FPS_LIMIT
+        last_display_emit = 0.0
+        last_position_emit = 0.0
         self.status.emit("source opened")
         self.video_info.emit(total_frames, float(source_fps))
 
@@ -736,23 +752,31 @@ class CaptureWorker(QThread):
                 break
 
             self.frame_buffer.update(frame, frame_index, total_frames)
-            self.input_frame.emit(bgr_to_qimage(frame))
-            mask_snapshot = self.mask_buffer.get_latest()
-            if mask_snapshot is None:
-                self.output_frame.emit(bgr_to_qimage(frame))
-            else:
-                self.output_frame.emit(
-                    bgr_to_qimage(
-                        overlay_effect_mask(
-                            frame,
-                            mask_snapshot.mask,
-                            mask_snapshot.threshold,
-                            mask_snapshot.mode,
-                            mask_snapshot.blur_kernel,
+            now = time.perf_counter()
+            should_emit_display = now - last_display_emit >= display_interval or requested_seek is not None
+            should_emit_position = now - last_position_emit >= position_interval or should_emit_display
+            if should_emit_display:
+                preview_frame = resize_frame_for_display(frame)
+                self.input_frame.emit(bgr_to_qimage(preview_frame))
+                mask_snapshot = self.mask_buffer.get_latest()
+                if mask_snapshot is None:
+                    self.output_frame.emit(bgr_to_qimage(preview_frame))
+                else:
+                    self.output_frame.emit(
+                        bgr_to_qimage(
+                            overlay_effect_mask(
+                                preview_frame,
+                                mask_snapshot.mask,
+                                mask_snapshot.threshold,
+                                mask_snapshot.mode,
+                                mask_snapshot.blur_kernel,
+                            )
                         )
                     )
-                )
-            self.position_changed.emit(frame_index, total_frames)
+                last_display_emit = now
+            if should_emit_position:
+                self.position_changed.emit(frame_index, total_frames)
+                last_position_emit = now
             frame_index += 1
 
             if isinstance(self.source, str) and source_fps > 0:
@@ -1087,6 +1111,7 @@ class MainWindow(QMainWindow):
         self.sweep_worker: SweepWorker | None = None
         self.benchmark_worker: BenchmarkWorker | None = None
         self.retiring_threads: list[QThread] = []
+        self.latest_sweep_results: list[dict] = []
         self.latest_benchmark_results: list[dict] = []
 
         self.setWindowTitle("Focus On You - Real-time Prompt Segmentation MVP")
@@ -1267,12 +1292,17 @@ class MainWindow(QMainWindow):
         sweep_box = QGroupBox("Optimization Sweep")
         sweep_layout = QVBoxLayout(sweep_box)
         self.sweep_button = QPushButton("Run Sweep On Current Frame")
+        self.save_sweep_button = QPushButton("Save result")
+        self.save_sweep_button.setEnabled(False)
+        sweep_button_row = QHBoxLayout()
+        sweep_button_row.addWidget(self.sweep_button)
+        sweep_button_row.addWidget(self.save_sweep_button)
         self.sweep_table = QTableWidget(0, 7)
         self.sweep_table.setHorizontalHeaderLabels(["backend", "prompt", "skip", "scale", "thr", "lat ms", "coverage"])
         fit_table_to_panel(self.sweep_table)
         self.sweep_table.setMinimumHeight(120)
         self.sweep_table.setMaximumHeight(170)
-        sweep_layout.addWidget(self.sweep_button)
+        sweep_layout.addLayout(sweep_button_row)
         sweep_layout.addWidget(self.sweep_table)
         controls.addWidget(sweep_box)
 
@@ -1354,6 +1384,7 @@ class MainWindow(QMainWindow):
         self.video_seek.sliderReleased.connect(self.seek_video)
         self.reset_hyperparams_button.clicked.connect(self.reset_hyperparameters)
         self.sweep_button.clicked.connect(self.run_sweep)
+        self.save_sweep_button.clicked.connect(self.save_sweep_results)
         self.benchmark_button.clicked.connect(self.run_benchmark)
         self.save_benchmark_button.clicked.connect(self.save_benchmark_results)
         self.sweep_prompts.textChanged.connect(self.update_sweep_estimate)
@@ -1694,6 +1725,8 @@ class MainWindow(QMainWindow):
         if any(model_id != self.segmenter.model_name for model_id in sweep_config.model_ids):
             self.stop_worker(wait=True)
         self.sweep_button.setEnabled(False)
+        self.save_sweep_button.setEnabled(False)
+        self.latest_sweep_results = []
         self.sweep_table.setRowCount(0)
         self.sweep_worker = SweepWorker(self.segmenter, frame, self.current_settings(), sweep_config)
         self.sweep_worker.finished_with_results.connect(self.populate_sweep)
@@ -1703,6 +1736,7 @@ class MainWindow(QMainWindow):
 
     @Slot(list)
     def populate_sweep(self, rows: list[dict]) -> None:
+        self.latest_sweep_results = rows
         self.sweep_table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             values = [
@@ -1716,7 +1750,52 @@ class MainWindow(QMainWindow):
             ]
             for col, value in enumerate(values):
                 self.sweep_table.setItem(row_index, col, QTableWidgetItem(value))
+        self.save_sweep_button.setEnabled(bool(rows))
         self.set_status("Sweep complete")
+
+    @Slot()
+    def save_sweep_results(self) -> None:
+        if not self.latest_sweep_results:
+            QMessageBox.warning(self, "No sweep results", "Run an optimization sweep before saving results.")
+            self.save_sweep_button.setEnabled(False)
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save sweep result",
+            str(Path.cwd() / "sweep_result.csv"),
+            "CSV files (*.csv)",
+        )
+        if not path:
+            return
+
+        output_path = Path(path)
+        if output_path.suffix.lower() != ".csv":
+            output_path = output_path.with_suffix(".csv")
+
+        fieldnames = [
+            "backend",
+            "prompt",
+            "skip_frames",
+            "infer_scale",
+            "threshold",
+            "latency_ms",
+            "model_latency_ms",
+            "mask_coverage",
+        ]
+        try:
+            with output_path.open("w", newline="", encoding="utf-8") as csv_file:
+                writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in self.latest_sweep_results:
+                    output_row = {field: row.get(field, "") for field in fieldnames}
+                    output_row["backend"] = row.get("model_id", "")
+                    writer.writerow(output_row)
+        except Exception as exc:
+            QMessageBox.warning(self, "Save failed", str(exc))
+            return
+
+        self.set_status(f"Sweep result saved: {output_path}")
 
     @Slot()
     def run_benchmark(self) -> None:

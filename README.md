@@ -12,7 +12,7 @@
 - 텍스트 프롬프트 기반 대상 영역 추정
 - 비대상 영역 효과 적용: `blur`, `remove`, `dim`, `mask`
 - 실시간 FPS, 지연 시간, 모델 지연 시간, 마스크 커버리지 표시
-- 현재 프레임 기준 하이퍼파라미터 스윕
+- 현재 프레임 기준 하이퍼파라미터 스윕 및 CSV 저장
 - CamVid 도로 클래스 기준 GT 벤치마크
 - 벤치마크 결과 CSV 저장
 
@@ -130,6 +130,8 @@ Scales: 0.25,0.50,0.75,1.00
 Thresholds: 0.35,0.50,0.65
 Skip frames: 0
 ```
+
+스윕 완료 후 Optimization Sweep 영역의 `Save result` 버튼을 누르면 조합별 `backend`, `prompt`, `skip_frames`, `infer_scale`, `threshold`, `latency_ms`, `model_latency_ms`, `mask_coverage` 값을 CSV 파일로 저장할 수 있습니다.
 
 ## CamVid 벤치마크
 
