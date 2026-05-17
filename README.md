@@ -67,7 +67,7 @@ python main.py
 
 ```bash
 python main.py --backend CLIPSeg --device cpu
-python main.py --backend "YOLO-World small box-only" --device cuda
+python main.py --backend "YOLO-seg" --device cuda
 ```
 
 처음 실행하거나 처음 추론할 때는 모델 파일을 내려받기 때문에 시간이 걸릴 수 있습니다.
@@ -107,10 +107,10 @@ python main.py --backend "YOLO-World small box-only" --device cuda
 
 ## 지원 백엔드
 
-현재 실행 가능한 백엔드는 다음과 같습니다.
+현재 지원하는 백엔드 모델은 다음 두 가지입니다.
 
-- `CLIPSeg`: `CIDAS/clipseg-rd64-refined` 기반 텍스트-마스크 세그멘테이션
-- `YOLO-World small box-only`: 오픈 보캐뷸러리 박스 검출 결과를 이진 마스크로 변환
+- `SegCLIP`: 텍스트 프롬프트를 기반으로 대상 영역 마스크를 생성하는 세그멘테이션 모델입니다. 현재 코드에서는 `CLIPSeg` 이름으로 표시되며 `CIDAS/clipseg-rd64-refined`를 사용합니다.
+- `Yolo-seg`: 텍스트 프롬프트 기반 객체 검출 결과를 마스크처럼 사용해 대상 영역을 보존합니다. 현재 코드에서는 `YOLO-World small box-only` 이름으로 표시됩니다.
 
 UI에는 다음 백엔드도 표시되지만, 필요한 런타임과 체크포인트가 아직 포함되어 있지 않아 실행은 차단됩니다.
 
