@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import sys
 import threading
 import time
@@ -66,12 +67,14 @@ except ImportError as exc:  # pragma: no cover - only used when dependency is mi
 CLIPSEG_MODEL_NAME = "CIDAS/clipseg-rd64-refined"
 BACKEND_CLIPSEG = "CLIPSeg"
 BACKEND_YOLO_WORLD_BOX = "YOLO-World small box-only"
+BACKEND_YOLO11N_SEG = "YOLO11n-seg"
 BACKEND_YOLO_WORLD_SAM2 = "YOLO-World small + SAM2 tiny tracking"
 BACKEND_SAM3 = "SAM 3"
 BACKEND_GDINO_SAM2 = "Grounding DINO tiny + SAM2 tiny"
 BACKEND_PRESETS = [
     BACKEND_CLIPSEG,
     BACKEND_YOLO_WORLD_BOX,
+    BACKEND_YOLO11N_SEG,
     BACKEND_YOLO_WORLD_SAM2,
     BACKEND_SAM3,
     BACKEND_GDINO_SAM2,
@@ -79,9 +82,12 @@ BACKEND_PRESETS = [
 RUNNABLE_BACKENDS = {
     BACKEND_CLIPSEG,
     BACKEND_YOLO_WORLD_BOX,
+    BACKEND_YOLO11N_SEG,
 }
 YOLO_WORLD_MODEL = "yolov8s-world.pt"
+YOLO11N_SEG_MODEL = str(Path(__file__).resolve().parent / "weights" / "yolo11n-seg.pt")
 YOLOWorld = None
+YOLO = None
 CAMVID_VIDEO = Path("benchmark_data/camvid_road_0001TP.mp4")
 CAMVID_GT_DIR = Path("benchmark_gt/camvid_road_0001TP")
 
@@ -248,6 +254,17 @@ def get_yolo_world_cls():
     return YOLOWorld
 
 
+def get_yolo_cls():
+    global YOLO
+    if YOLO is None:
+        try:
+            from ultralytics import YOLO as YOLOClass
+        except ImportError as exc:  # pragma: no cover - optional backend.
+            raise RuntimeError("YOLO11n-seg backend requires ultralytics. Install it with: pip install ultralytics") from exc
+        YOLO = YOLOClass
+    return YOLO
+
+
 def prompt_to_classes(prompt: str) -> list[str]:
     classes = [item.strip() for item in prompt.split(",") if item.strip()]
     if not classes and prompt.strip():
@@ -255,6 +272,51 @@ def prompt_to_classes(prompt: str) -> list[str]:
     if not classes:
         raise ValueError("Prompt must contain at least one target class")
     return classes
+
+
+COCO_CLASS_ALIASES: dict[str, list[int]] = {
+    "person": [0],
+    "people": [0],
+    "human": [0],
+    "man": [0],
+    "woman": [0],
+    "pedestrian": [0],
+    "사람": [0],
+    "bicycle": [1],
+    "bike": [1],
+    "car": [2],
+    "vehicle": [1, 2, 3, 5, 7],
+    "자동차": [2],
+    "motorcycle": [3],
+    "bus": [5],
+    "truck": [7],
+    "cat": [15],
+    "dog": [16],
+    "강아지": [16],
+    "개": [16],
+    "animal": [14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
+}
+
+
+def coco_classes_for_prompt(prompt: str) -> list[int]:
+    normalized = normalize_prompt(prompt)
+    direct = COCO_CLASS_ALIASES.get(normalized)
+    if direct is not None:
+        return direct
+
+    classes: list[int] = []
+    for word in normalized.split():
+        classes.extend(COCO_CLASS_ALIASES.get(word, []))
+    if not classes:
+        supported = ", ".join(sorted(COCO_CLASS_ALIASES))
+        raise ValueError(f"YOLO11n-seg supports COCO class prompts only. Supported aliases: {supported}")
+    return sorted(set(classes))
+
+
+def normalize_prompt(prompt: str) -> str:
+    normalized = prompt.strip().lower().replace("_", " ").replace("-", " ")
+    words = [word for word in normalized.split() if word not in {"a", "an", "the"}]
+    return " ".join(words)
 
 
 def backend_unavailable_message(backend_name: str) -> str | None:
@@ -402,9 +464,13 @@ class PromptSegmenter:
         self.processor: CLIPSegProcessor | None = None
         self.model: CLIPSegForImageSegmentation | None = None
         self.yolo_model = None
+        self.yolo_seg_model = None
         self.lock = threading.Lock()
 
     def load(self) -> None:
+        if self.model_name == BACKEND_YOLO11N_SEG:
+            self.load_yolo11n_seg()
+            return
         if self.model_name != BACKEND_CLIPSEG:
             self.load_yolo_world() if self.model_name == BACKEND_YOLO_WORLD_BOX else self.ensure_backend_available()
             return
@@ -428,6 +494,15 @@ class PromptSegmenter:
             yolo_cls = get_yolo_world_cls()
             self.yolo_model = yolo_cls(YOLO_WORLD_MODEL)
 
+    def load_yolo11n_seg(self) -> None:
+        if self.yolo_seg_model is not None:
+            return
+        with self.lock:
+            if self.yolo_seg_model is not None:
+                return
+            yolo_cls = get_yolo_cls()
+            self.yolo_seg_model = yolo_cls(YOLO11N_SEG_MODEL)
+
     def ensure_backend_available(self) -> None:
         message = backend_unavailable_message(self.model_name)
         if message is not None:
@@ -443,13 +518,27 @@ class PromptSegmenter:
             self.processor = None
             self.model = None
             self.yolo_model = None
+            self.yolo_seg_model = None
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
             self.model_name = model_name
             self.device = torch.device(device)
+        gc.collect()
+
+    def close(self) -> None:
+        with self.lock:
+            self.processor = None
+            self.model = None
+            self.yolo_model = None
+            self.yolo_seg_model = None
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
 
     @torch.inference_mode()
     def predict_mask(self, frame: np.ndarray, prompt: str, infer_scale: float) -> tuple[np.ndarray, float]:
+        if self.model_name == BACKEND_YOLO11N_SEG:
+            return self.predict_yolo11n_seg_mask(frame, prompt, infer_scale)
         if self.model_name == BACKEND_YOLO_WORLD_BOX:
             return self.predict_yolo_world_box_mask(frame, prompt, infer_scale)
         if self.model_name != BACKEND_CLIPSEG:
@@ -526,6 +615,42 @@ class PromptSegmenter:
                 mask[top:bottom, left:right] = 1.0
         return mask, model_latency_ms
 
+    @torch.inference_mode()
+    def predict_yolo11n_seg_mask(self, frame: np.ndarray, prompt: str, infer_scale: float) -> tuple[np.ndarray, float]:
+        self.load_yolo11n_seg()
+        assert self.yolo_seg_model is not None
+
+        class_ids = coco_classes_for_prompt(prompt)
+        height, width = frame.shape[:2]
+        scale = min(1.0, max(0.05, infer_scale))
+        imgsz = max(320, int(round(max(width, height) * scale)))
+
+        started = time.perf_counter()
+        results = self.yolo_seg_model.predict(
+            frame,
+            imgsz=imgsz,
+            conf=0.25,
+            iou=0.7,
+            classes=class_ids,
+            retina_masks=True,
+            device=str(self.device),
+            verbose=False,
+        )
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        model_latency_ms = (time.perf_counter() - started) * 1000.0
+
+        mask = np.zeros((height, width), dtype=np.float32)
+        if not results or results[0].masks is None:
+            return mask, model_latency_ms
+        raw_masks = results[0].masks.data.detach().cpu().numpy()
+        for raw_mask in raw_masks:
+            mask_part = raw_mask.astype(np.float32)
+            if mask_part.shape != (height, width):
+                mask_part = cv2.resize(mask_part, (width, height), interpolation=cv2.INTER_LINEAR)
+            mask = np.maximum(mask, mask_part)
+        return np.clip(mask, 0.0, 1.0).astype(np.float32), model_latency_ms
+
 
 class CaptureWorker(QThread):
     input_frame = Signal(QImage)
@@ -543,6 +668,8 @@ class CaptureWorker(QThread):
         self.paused = False
         self.seek_frame: int | None = None
         self.control_lock = threading.Lock()
+        self.cap: cv2.VideoCapture | None = None
+        self.cap_lock = threading.Lock()
 
     def set_source(self, source: int | str) -> None:
         self.source = source
@@ -552,6 +679,9 @@ class CaptureWorker(QThread):
 
     def stop(self) -> None:
         self.running = False
+        with self.cap_lock:
+            if self.cap is not None:
+                self.cap.release()
 
     def pause(self) -> None:
         with self.control_lock:
@@ -568,8 +698,14 @@ class CaptureWorker(QThread):
     def run(self) -> None:
         self.running = True
         cap = cv2.VideoCapture(self.source)
+        with self.cap_lock:
+            self.cap = cap
         if not cap.isOpened():
             self.status.emit(f"Could not open source: {self.source}")
+            with self.cap_lock:
+                if self.cap is cap:
+                    self.cap = None
+            cap.release()
             return
 
         frame_index = 0
@@ -625,6 +761,9 @@ class CaptureWorker(QThread):
                 if spent < frame_interval:
                     time.sleep(frame_interval - spent)
 
+        with self.cap_lock:
+            if self.cap is cap:
+                self.cap = None
         cap.release()
         self.status.emit("capture stopped")
 
@@ -947,6 +1086,7 @@ class MainWindow(QMainWindow):
         self.active_source: int | str | None = None
         self.sweep_worker: SweepWorker | None = None
         self.benchmark_worker: BenchmarkWorker | None = None
+        self.retiring_threads: list[QThread] = []
         self.latest_benchmark_results: list[dict] = []
 
         self.setWindowTitle("Focus On You - Real-time Prompt Segmentation MVP")
@@ -1024,9 +1164,13 @@ class MainWindow(QMainWindow):
         self.device_name.addItems(devices)
         self.device_name.setCurrentText(str(self.segmenter.device))
         self.apply_model_button = QPushButton("Apply Model")
+        self.current_backend_label = QLabel()
+        self.current_backend_label.setWordWrap(True)
+        self.current_backend_label.setStyleSheet("color: #47c2ff; font-weight: 700;")
         model_form.addRow("Backend", self.model_name)
         model_form.addRow("Device", self.device_name)
         model_form.addRow(self.apply_model_button)
+        model_form.addRow("Current", self.current_backend_label)
         controls.addWidget(model_box)
 
         source_box = QGroupBox("Source Controls")
@@ -1192,6 +1336,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.status_label)
         controls.addStretch(1)
         self.update_sweep_estimate()
+        self.update_current_backend_label()
 
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self.close)
@@ -1217,6 +1362,8 @@ class MainWindow(QMainWindow):
         self.sweep_thresholds.textChanged.connect(self.update_sweep_estimate)
         self.sweep_skip_frames.textChanged.connect(self.update_sweep_estimate)
         self.benchmark_frames.valueChanged.connect(self.update_sweep_estimate)
+        self.model_name.currentTextChanged.connect(self.on_backend_selection_changed)
+        self.device_name.currentTextChanged.connect(lambda: self.update_current_backend_label(pending=True))
         for widget in [
             self.prompt,
             self.mode,
@@ -1247,6 +1394,21 @@ class MainWindow(QMainWindow):
             QHeaderView::section { background: #202532; color: #aab2c0; border: 0; padding: 4px; }
             """
         )
+
+    @Slot(str)
+    def on_backend_selection_changed(self, backend_name: str) -> None:
+        self.update_sweep_estimate()
+        if backend_name == BACKEND_YOLO11N_SEG and self.prompt.text().strip().lower() == "road":
+            self.prompt.setText("person")
+        self.update_current_backend_label(pending=True)
+
+    def update_current_backend_label(self, *, pending: bool = False) -> None:
+        if pending:
+            self.current_backend_label.setText(
+                f"Pending: {self.model_name.currentText()} / {self.device_name.currentText()}"
+            )
+            return
+        self.current_backend_label.setText(f"{self.segmenter.model_name} / {self.segmenter.device}")
 
     def current_settings(self) -> RuntimeSettings:
         return RuntimeSettings(
@@ -1325,23 +1487,31 @@ class MainWindow(QMainWindow):
         if self.benchmark_worker is not None and self.benchmark_worker.isRunning():
             QMessageBox.warning(self, "Benchmark running", "Wait for the current benchmark before switching backends.")
             return
+        if self.retiring_threads:
+            QMessageBox.warning(self, "Worker stopping", "Wait for the previous source to finish stopping.")
+            self.model_name.setCurrentText(self.segmenter.model_name)
+            self.update_current_backend_label()
+            return
         requested_backend = self.model_name.currentText()
         unavailable_message = backend_unavailable_message(requested_backend)
         if unavailable_message is not None:
             QMessageBox.warning(self, "Backend unavailable", unavailable_message)
             self.model_name.setCurrentText(self.segmenter.model_name)
+            self.update_current_backend_label()
             return
-        self.stop_worker()
+        self.stop_worker(wait=True)
         try:
             self.segmenter.set_model(requested_backend, self.device_name.currentText())
         except Exception as exc:
             QMessageBox.warning(self, "Backend switch failed", str(exc))
             self.model_name.setCurrentText(self.segmenter.model_name)
+            self.update_current_backend_label()
             return
         self.set_status(
             f"Backend set to {self.segmenter.model_name} on {self.segmenter.device}. "
             "It will load on the next inference."
         )
+        self.update_current_backend_label()
 
     @Slot()
     def browse_video(self) -> None:
@@ -1350,7 +1520,7 @@ class MainWindow(QMainWindow):
             self.video_path.setText(path)
 
     def start_source(self, source: int | str) -> None:
-        self.stop_worker()
+        self.stop_worker(wait=True)
         self.active_source = source
         self.frame_buffer = LatestFrameBuffer()
         self.mask_buffer = LatestMaskBuffer()
@@ -1433,31 +1603,64 @@ class MainWindow(QMainWindow):
         self.video_position.setText(f"{frame_index} / {max(0, total_frames - 1)}")
 
     @Slot()
-    def stop_worker(self) -> None:
+    def stop_worker(self, *, wait: bool = False) -> None:
         capture_worker = self.capture_worker
         inference_worker = self.inference_worker
+        self.capture_worker = None
+        self.inference_worker = None
+        self.active_source = None
+        self.frame_buffer = None
+        self.mask_buffer = None
+
         if capture_worker is not None:
             capture_worker.stop()
         if inference_worker is not None:
             inference_worker.stop()
-        if capture_worker is not None:
-            capture_worker.wait(1500)
-        if inference_worker is not None:
-            inference_worker.wait(1500)
-        self.capture_worker = None
-        self.inference_worker = None
-        self.active_source = None
-        self.frame_buffer = None
+        for worker in [capture_worker, inference_worker]:
+            if worker is None:
+                continue
+            if wait and worker.isRunning() and worker.wait(5000):
+                worker.deleteLater()
+            elif worker.isRunning():
+                self.retire_thread(worker)
+            else:
+                worker.deleteLater()
 
     @Slot()
     def handle_capture_finished(self) -> None:
-        if self.inference_worker is not None:
-            self.inference_worker.stop()
-            self.inference_worker.wait(1500)
-        self.inference_worker = None
+        capture_worker = self.sender()
+        if capture_worker is not self.capture_worker:
+            return
+        inference_worker = self.inference_worker
+        finished_source = self.active_source
         self.capture_worker = None
+        self.inference_worker = None
         self.active_source = None
         self.frame_buffer = None
+        self.mask_buffer = None
+        if inference_worker is not None:
+            inference_worker.stop()
+            if inference_worker.isRunning():
+                self.retire_thread(inference_worker)
+            else:
+                inference_worker.deleteLater()
+        if isinstance(capture_worker, QThread):
+            capture_worker.deleteLater()
+        self.set_status("video finished" if isinstance(finished_source, str) else "capture stopped")
+
+    def retire_thread(self, thread: QThread) -> None:
+        if thread in self.retiring_threads:
+            return
+        self.retiring_threads.append(thread)
+        thread.finished.connect(lambda thread=thread: self.release_retired_thread(thread))
+        if not thread.isRunning():
+            self.release_retired_thread(thread)
+
+    def release_retired_thread(self, thread: QThread) -> None:
+        if thread not in self.retiring_threads:
+            return
+        self.retiring_threads.remove(thread)
+        thread.deleteLater()
 
     @Slot(object)
     def update_metrics(self, metrics: FrameMetrics) -> None:
@@ -1489,7 +1692,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Backend unavailable", unavailable_message)
                 return
         if any(model_id != self.segmenter.model_name for model_id in sweep_config.model_ids):
-            self.stop_worker()
+            self.stop_worker(wait=True)
         self.sweep_button.setEnabled(False)
         self.sweep_table.setRowCount(0)
         self.sweep_worker = SweepWorker(self.segmenter, frame, self.current_settings(), sweep_config)
@@ -1527,7 +1730,7 @@ class MainWindow(QMainWindow):
             if unavailable_message is not None:
                 QMessageBox.warning(self, "Backend unavailable", unavailable_message)
                 return
-        self.stop_worker()
+        self.stop_worker(wait=True)
         self.video_position.setText("benchmark")
         self.set_hyperparameter_controls_enabled(False)
         self.benchmark_button.setEnabled(False)
@@ -1651,10 +1854,15 @@ class MainWindow(QMainWindow):
         self.output_pane.set_image(output_image)
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        self.stop_worker()
+        self.stop_worker(wait=True)
+        for thread in list(self.retiring_threads):
+            if thread.isRunning():
+                thread.wait()
+            self.release_retired_thread(thread)
         for thread in [self.sweep_worker, self.benchmark_worker]:
             if thread is not None and thread.isRunning():
-                thread.wait(1000)
+                thread.wait()
+        self.segmenter.close()
         event.accept()
 
 
