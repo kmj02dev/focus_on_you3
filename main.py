@@ -820,6 +820,7 @@ class MainWindow(QMainWindow):
         self.benchmark_worker: BenchmarkWorker | None = None
         self.latest_display_frame: np.ndarray | None = None
         self.latest_mask_result: MaskResult | None = None
+        self.latest_sweep_results: list[dict] = []
         self.latest_benchmark_results: list[dict] = []
         self.processed_render_pending = False
         self.last_processed_render_at = 0.0
@@ -1010,11 +1011,16 @@ class MainWindow(QMainWindow):
         sweep_box = QGroupBox("Optimization Sweep")
         sweep_layout = QVBoxLayout(sweep_box)
         self.sweep_button = QPushButton("Run Sweep On Current Frame")
+        self.save_sweep_button = QPushButton("Save result")
+        self.save_sweep_button.setEnabled(False)
+        sweep_button_row = QHBoxLayout()
+        sweep_button_row.addWidget(self.sweep_button)
+        sweep_button_row.addWidget(self.save_sweep_button)
         self.sweep_table = QTableWidget(0, 4)
         self.sweep_table.setHorizontalHeaderLabels(["scale", "thr", "lat ms", "coverage"])
         self.sweep_table.setMinimumHeight(120)
         self.sweep_table.setMaximumHeight(170)
-        sweep_layout.addWidget(self.sweep_button)
+        sweep_layout.addLayout(sweep_button_row)
         sweep_layout.addWidget(self.sweep_table)
         controls.addWidget(sweep_box)
 
@@ -1070,6 +1076,7 @@ class MainWindow(QMainWindow):
         self.video_seek.sliderReleased.connect(self.seek_video)
         self.reset_hyperparams_button.clicked.connect(self.reset_hyperparameters)
         self.sweep_button.clicked.connect(self.run_sweep)
+        self.save_sweep_button.clicked.connect(self.save_sweep_results)
         self.benchmark_button.clicked.connect(self.run_benchmark)
         self.save_benchmark_button.clicked.connect(self.save_benchmark_results)
         self.sweep_scales.textChanged.connect(self.update_sweep_estimate)
@@ -1377,6 +1384,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid sweep space", str(exc))
             return
         self.sweep_button.setEnabled(False)
+        self.save_sweep_button.setEnabled(False)
+        self.latest_sweep_results = []
         self.sweep_table.setRowCount(0)
         self.sweep_worker = SweepWorker(self.segmenter, frame, self.current_settings(), sweep_config)
         self.sweep_worker.finished_with_results.connect(self.populate_sweep)
@@ -1386,6 +1395,7 @@ class MainWindow(QMainWindow):
 
     @Slot(list)
     def populate_sweep(self, rows: list[dict]) -> None:
+        self.latest_sweep_results = rows
         self.sweep_table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             values = [
@@ -1396,7 +1406,47 @@ class MainWindow(QMainWindow):
             ]
             for col, value in enumerate(values):
                 self.sweep_table.setItem(row_index, col, QTableWidgetItem(value))
+        self.save_sweep_button.setEnabled(bool(rows))
         self.set_status("Sweep complete")
+
+    @Slot()
+    def save_sweep_results(self) -> None:
+        if not self.latest_sweep_results:
+            QMessageBox.warning(self, "No sweep results", "Run an optimization sweep before saving results.")
+            self.save_sweep_button.setEnabled(False)
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save sweep result",
+            str(Path.cwd() / "sweep_result.csv"),
+            "CSV files (*.csv)",
+        )
+        if not path:
+            return
+
+        output_path = Path(path)
+        if output_path.suffix.lower() != ".csv":
+            output_path = output_path.with_suffix(".csv")
+
+        fieldnames = [
+            "infer_scale",
+            "threshold",
+            "latency_ms",
+            "model_latency_ms",
+            "mask_coverage",
+        ]
+        try:
+            with output_path.open("w", newline="", encoding="utf-8") as csv_file:
+                writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in self.latest_sweep_results:
+                    writer.writerow({field: row.get(field, "") for field in fieldnames})
+        except Exception as exc:
+            QMessageBox.warning(self, "Save failed", str(exc))
+            return
+
+        self.set_status(f"Sweep result saved: {output_path}")
 
     @Slot()
     def run_benchmark(self) -> None:

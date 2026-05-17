@@ -48,7 +48,7 @@ It supports:
 - prompt-based target preservation
 - non-target blur/remove/dim/mask preview
 - live FPS and latency metrics
-- optimization sweep on the current frame
+- optimization sweep on the current frame with CSV export
 - CamVid GT benchmark sweep with visible progress and every-frame preview
 
 Live playback uses a split pipeline: one worker captures camera/video frames and another worker runs inference on the latest available frame. This keeps input playback responsive even when model inference is slower than the capture rate. The left and right panes render from the same current source frame; the right `Processed` pane applies the latest available asynchronous mask with a target overlay.
@@ -78,6 +78,8 @@ The sweep space is editable in the UI as comma-separated values:
 - `Thresholds CSV`: default `0.35,0.50,0.65`
 
 The app shows the resulting combination count before running the current-frame sweep or CamVid benchmark.
+
+After `Run Sweep On Current Frame` completes, use the `Save result` button in the Optimization Sweep area to export `infer_scale`, `threshold`, `latency_ms`, `model_latency_ms`, and `mask_coverage` to CSV.
 
 Use `Reset Hyperparameters` to restore the default prompt/effect/realtime/benchmark settings.
 
