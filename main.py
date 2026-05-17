@@ -31,7 +31,7 @@ from PIL import Image
 from transformers import CLIPSegForImageSegmentation, CLIPSegProcessor
 
 try:
-    from PySide6.QtCore import Qt, QThread, Signal, Slot
+    from PySide6.QtCore import Qt, QThread, QTimer, Signal, Slot
     from PySide6.QtGui import QAction, QImage, QPixmap
     from PySide6.QtWidgets import (
         QApplication,
@@ -66,6 +66,10 @@ YOLO_WORLD_MODEL = "yolov8s-world.pt"
 YOLOWorld = None
 CAMVID_VIDEO = Path("benchmark_data/camvid_road_0001TP.mp4")
 CAMVID_GT_DIR = Path("benchmark_gt/camvid_road_0001TP")
+DISPLAY_MAX_DIMENSION = 960
+DISPLAY_FPS_LIMIT = 15.0
+POSITION_FPS_LIMIT = 10.0
+YOLO_IMAGE_STRIDE = 32
 
 DEFAULT_SETTINGS = {
     "prompt": "road",
@@ -135,23 +139,18 @@ class LatestFrameBuffer:
         self.latest: CapturedFrame | None = None
         self.sequence = 0
 
-    def update(self, frame: np.ndarray, frame_index: int, total_frames: int) -> CapturedFrame:
+    def update(self, frame: np.ndarray, frame_index: int, total_frames: int) -> tuple[float, int]:
         with self.lock:
             self.sequence += 1
+            captured_at = time.perf_counter()
             self.latest = CapturedFrame(
                 frame=frame.copy(),
                 frame_index=frame_index,
                 total_frames=total_frames,
-                captured_at=time.perf_counter(),
+                captured_at=captured_at,
                 sequence=self.sequence,
             )
-            return CapturedFrame(
-                frame=self.latest.frame.copy(),
-                frame_index=self.latest.frame_index,
-                total_frames=self.latest.total_frames,
-                captured_at=self.latest.captured_at,
-                sequence=self.latest.sequence,
-            )
+            return captured_at, self.sequence
 
     def get_latest(self) -> CapturedFrame | None:
         with self.lock:
@@ -191,6 +190,21 @@ def bgr_to_qimage(frame: np.ndarray) -> QImage:
     height, width, channels = rgb.shape
     bytes_per_line = channels * width
     return QImage(rgb.data, width, height, bytes_per_line, QImage.Format_RGB888).copy()
+
+
+def resize_frame_for_display(frame: np.ndarray, max_dimension: int = DISPLAY_MAX_DIMENSION) -> np.ndarray:
+    height, width = frame.shape[:2]
+    largest = max(height, width)
+    if largest <= max_dimension:
+        return frame.copy()
+    scale = max_dimension / largest
+    resized_width = max(1, round(width * scale))
+    resized_height = max(1, round(height * scale))
+    return cv2.resize(frame, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
+
+
+def round_up_to_stride(value: int, stride: int) -> int:
+    return max(stride, ((value + stride - 1) // stride) * stride)
 
 
 def parse_float_csv(text: str, minimum: float, maximum: float, label: str) -> list[float]:
@@ -381,7 +395,7 @@ class PromptSegmenter:
         else:
             resized = frame
 
-        image_size = max(resized.shape[:2])
+        image_size = round_up_to_stride(max(resized.shape[:2]), YOLO_IMAGE_STRIDE)
         started = time.perf_counter()
         results = self.yolo_model.predict(
             resized,
@@ -457,6 +471,7 @@ class CaptureWorker(QThread):
     def run(self) -> None:
         self.running = True
         cap = cv2.VideoCapture(self.source)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if not cap.isOpened():
             self.status.emit(f"Could not open source: {self.source}")
             return
@@ -464,9 +479,10 @@ class CaptureWorker(QThread):
         frame_index = 0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if isinstance(self.source, str) else 0
         source_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
-        processed = 0
-        skipped = 0
-        last_emit = time.perf_counter()
+        display_interval = 1.0 / DISPLAY_FPS_LIMIT
+        position_interval = 1.0 / POSITION_FPS_LIMIT
+        last_display_emit = 0.0
+        last_position_emit = 0.0
         self.status.emit("source opened")
         self.video_info.emit(total_frames, float(source_fps))
 
@@ -488,9 +504,25 @@ class CaptureWorker(QThread):
             if not ok:
                 break
 
-            captured = self.frame_buffer.update(frame, frame_index, total_frames)
-            self.display_frame.emit(captured)
-            self.position_changed.emit(frame_index, total_frames)
+            captured_at, sequence = self.frame_buffer.update(frame, frame_index, total_frames)
+            now = time.perf_counter()
+            should_emit_display = now - last_display_emit >= display_interval or requested_seek is not None
+            should_emit_position = now - last_position_emit >= position_interval or should_emit_display
+            if should_emit_display:
+                preview_frame = resize_frame_for_display(frame)
+                self.display_frame.emit(
+                    CapturedFrame(
+                        frame=preview_frame,
+                        frame_index=frame_index,
+                        total_frames=total_frames,
+                        captured_at=captured_at,
+                        sequence=sequence,
+                    )
+                )
+                last_display_emit = now
+            if should_emit_position:
+                self.position_changed.emit(frame_index, total_frames)
+                last_position_emit = now
             frame_index += 1
 
             if isinstance(self.source, str) and source_fps > 0:
@@ -597,12 +629,20 @@ class SweepWorker(QThread):
         self.frame = frame
         self.settings = settings
         self.sweep_config = sweep_config
+        self.running = False
+
+    def stop(self) -> None:
+        self.running = False
 
     def run(self) -> None:
         try:
+            self.running = True
             results = []
             for infer_scale in self.sweep_config.scales:
                 for threshold in self.sweep_config.thresholds:
+                    if not self.running:
+                        self.status.emit("Sweep stopped")
+                        return
                     started = time.perf_counter()
                     mask, model_latency_ms = self.segmenter.predict(
                         self.frame,
@@ -645,9 +685,14 @@ class BenchmarkWorker(QThread):
         self.settings = settings
         self.max_frames = max_frames
         self.sweep_config = sweep_config
+        self.running = False
+
+    def stop(self) -> None:
+        self.running = False
 
     def run(self) -> None:
         try:
+            self.running = True
             if not CAMVID_VIDEO.exists() or not CAMVID_GT_DIR.exists():
                 raise RuntimeError("CamVid benchmark files not found. Run benchmark/prepare_camvid_benchmark.py first.")
 
@@ -681,6 +726,9 @@ class BenchmarkWorker(QThread):
             ]
             total_combinations = len(combinations)
             for combo_index, (infer_scale, threshold) in enumerate(combinations, start=1):
+                if not self.running:
+                    self.status.emit("Benchmark stopped")
+                    return
                 self.progress.emit(
                     combo_index,
                     total_combinations,
@@ -690,6 +738,9 @@ class BenchmarkWorker(QThread):
                 latencies = []
                 started = time.perf_counter()
                 for frame_offset, (frame, gt_mask) in enumerate(zip(frames, gt_masks)):
+                    if not self.running:
+                        self.status.emit("Benchmark stopped")
+                        return
                     mask, model_latency_ms = self.segmenter.predict(
                         frame,
                         self.settings.prompt,
@@ -770,6 +821,8 @@ class MainWindow(QMainWindow):
         self.latest_display_frame: np.ndarray | None = None
         self.latest_mask_result: MaskResult | None = None
         self.latest_benchmark_results: list[dict] = []
+        self.processed_render_pending = False
+        self.last_processed_render_at = 0.0
 
         self.setWindowTitle("Focus On You - Real-time Prompt Segmentation MVP")
         self.resize(1360, 860)
@@ -1104,7 +1157,7 @@ class MainWindow(QMainWindow):
     def push_settings(self, *args) -> None:  # type: ignore[no-untyped-def]
         if self.inference_worker is not None:
             self.inference_worker.configure(self.current_settings())
-        self.render_processed_pane()
+        self.schedule_processed_render()
 
     @Slot(int)
     def on_threshold_changed(self, value: int) -> None:
@@ -1228,13 +1281,18 @@ class MainWindow(QMainWindow):
         capture_worker = self.capture_worker
         inference_worker = self.inference_worker
         if capture_worker is not None:
+            try:
+                capture_worker.finished.disconnect(self.handle_capture_finished)
+            except (RuntimeError, TypeError):
+                pass
+        if capture_worker is not None:
             capture_worker.stop()
         if inference_worker is not None:
             inference_worker.stop()
-        if capture_worker is not None:
-            capture_worker.wait(1500)
-        if inference_worker is not None:
-            inference_worker.wait(1500)
+        if capture_worker is not None and capture_worker.isRunning():
+            capture_worker.wait()
+        if inference_worker is not None and inference_worker.isRunning():
+            inference_worker.wait()
         self.capture_worker = None
         self.inference_worker = None
         self.active_source = None
@@ -1244,9 +1302,13 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def handle_capture_finished(self) -> None:
-        if self.inference_worker is not None:
-            self.inference_worker.stop()
-            self.inference_worker.wait(1500)
+        if self.capture_worker is not None and self.sender() is not self.capture_worker:
+            return
+        inference_worker = self.inference_worker
+        if inference_worker is not None:
+            inference_worker.stop()
+            if inference_worker.isRunning():
+                inference_worker.wait()
         self.inference_worker = None
         self.capture_worker = None
         self.active_source = None
@@ -1256,14 +1318,25 @@ class MainWindow(QMainWindow):
     def update_live_frame(self, captured: CapturedFrame) -> None:
         self.latest_display_frame = captured.frame
         self.input_pane.set_image(bgr_to_qimage(captured.frame))
-        self.render_processed_pane()
+        self.schedule_processed_render()
 
     @Slot(object)
     def update_mask_result(self, result: MaskResult) -> None:
         self.latest_mask_result = result
-        self.render_processed_pane()
+        self.schedule_processed_render()
+
+    def schedule_processed_render(self) -> None:
+        if self.processed_render_pending:
+            return
+        now = time.perf_counter()
+        min_interval = 1.0 / DISPLAY_FPS_LIMIT
+        delay_ms = max(0, round((min_interval - (now - self.last_processed_render_at)) * 1000.0))
+        self.processed_render_pending = True
+        QTimer.singleShot(delay_ms, self.render_processed_pane)
 
     def render_processed_pane(self) -> None:
+        self.processed_render_pending = False
+        self.last_processed_render_at = time.perf_counter()
         if self.latest_display_frame is None:
             return
         settings = self.current_settings()
@@ -1438,8 +1511,10 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         self.stop_worker()
         for thread in [self.sweep_worker, self.benchmark_worker]:
-            if thread is not None and thread.isRunning():
-                thread.wait(1000)
+            if thread is not None:
+                thread.stop()
+                if thread.isRunning():
+                    thread.wait()
         event.accept()
 
 
