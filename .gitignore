@@ -5,6 +5,7 @@ __pycache__/
 outputs/
 datasets/
 *.pt
+weights/*.pt
 
 # Local environment files
 .env

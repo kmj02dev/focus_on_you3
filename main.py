@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import sys
 import threading
 import time
@@ -31,15 +32,17 @@ from PIL import Image
 from transformers import CLIPSegForImageSegmentation, CLIPSegProcessor
 
 try:
-    from PySide6.QtCore import Qt, QThread, QTimer, Signal, Slot
+    from PySide6.QtCore import Qt, QThread, Signal, Slot
     from PySide6.QtGui import QAction, QImage, QPixmap
     from PySide6.QtWidgets import (
+        QAbstractScrollArea,
         QApplication,
         QComboBox,
         QFileDialog,
         QFormLayout,
         QGridLayout,
         QGroupBox,
+        QHeaderView,
         QHBoxLayout,
         QLabel,
         QLineEdit,
@@ -61,26 +64,48 @@ except ImportError as exc:  # pragma: no cover - only used when dependency is mi
     raise
 
 
-MODEL_NAME = "CIDAS/clipseg-rd64-refined"
+CLIPSEG_MODEL_NAME = "CIDAS/clipseg-rd64-refined"
+BACKEND_CLIPSEG = "CLIPSeg"
+BACKEND_YOLO_WORLD_BOX = "YOLO-World small box-only"
+BACKEND_YOLO11N_SEG = "YOLO11n-seg"
+BACKEND_YOLO_WORLD_SAM2 = "YOLO-World small + SAM2 tiny tracking"
+BACKEND_SAM3 = "SAM 3"
+BACKEND_GDINO_SAM2 = "Grounding DINO tiny + SAM2 tiny"
+BACKEND_PRESETS = [
+    BACKEND_CLIPSEG,
+    BACKEND_YOLO_WORLD_BOX,
+    BACKEND_YOLO11N_SEG,
+    BACKEND_YOLO_WORLD_SAM2,
+    BACKEND_SAM3,
+    BACKEND_GDINO_SAM2,
+]
+RUNNABLE_BACKENDS = {
+    BACKEND_CLIPSEG,
+    BACKEND_YOLO_WORLD_BOX,
+    BACKEND_YOLO11N_SEG,
+}
 YOLO_WORLD_MODEL = "yolov8s-world.pt"
+YOLO11N_SEG_MODEL = str(Path(__file__).resolve().parent / "weights" / "yolo11n-seg.pt")
 YOLOWorld = None
+YOLO = None
 CAMVID_VIDEO = Path("benchmark_data/camvid_road_0001TP.mp4")
 CAMVID_GT_DIR = Path("benchmark_gt/camvid_road_0001TP")
 DISPLAY_MAX_DIMENSION = 960
 DISPLAY_FPS_LIMIT = 15.0
 POSITION_FPS_LIMIT = 10.0
-YOLO_IMAGE_STRIDE = 32
 
 DEFAULT_SETTINGS = {
     "prompt": "road",
-    "backend": "CLIPSeg mask",
     "mode": "blur",
     "threshold": 50,
     "infer_scale": "0.50",
+    "sweep_prompts": "road",
+    "sweep_models": BACKEND_CLIPSEG,
     "sweep_scales": "0.25,0.50,0.75,1.00",
     "sweep_thresholds": "0.35,0.50,0.65",
+    "sweep_skip_frames": "0",
     "blur_kernel": 35,
-    "frame_stride": 1,
+    "skip_frames": 0,
     "benchmark_frames": 0,
 }
 
@@ -88,22 +113,30 @@ DEFAULT_SETTINGS = {
 @dataclass
 class RuntimeSettings:
     prompt: str = "road"
-    backend: str = "CLIPSeg mask"
     mode: str = "blur"
     threshold: float = 0.5
     infer_scale: float = 0.5
     blur_kernel: int = 35
-    frame_stride: int = 1
+    skip_frames: int = 0
 
 
 @dataclass
 class SweepConfig:
+    prompts: list[str]
+    model_ids: list[str]
     scales: list[float]
     thresholds: list[float]
+    skip_frames: list[int]
 
     @property
     def combination_count(self) -> int:
-        return len(self.scales) * len(self.thresholds)
+        return (
+            len(self.prompts)
+            * len(self.model_ids)
+            * len(self.scales)
+            * len(self.thresholds)
+            * len(self.skip_frames)
+        )
 
 
 @dataclass
@@ -127,9 +160,11 @@ class CapturedFrame:
 
 
 @dataclass
-class MaskResult:
+class MaskSnapshot:
     mask: np.ndarray
-    frame_shape: tuple[int, int]
+    threshold: float
+    mode: str
+    blur_kernel: int
     sequence: int
 
 
@@ -139,18 +174,16 @@ class LatestFrameBuffer:
         self.latest: CapturedFrame | None = None
         self.sequence = 0
 
-    def update(self, frame: np.ndarray, frame_index: int, total_frames: int) -> tuple[float, int]:
+    def update(self, frame: np.ndarray, frame_index: int, total_frames: int) -> None:
         with self.lock:
             self.sequence += 1
-            captured_at = time.perf_counter()
             self.latest = CapturedFrame(
                 frame=frame.copy(),
                 frame_index=frame_index,
                 total_frames=total_frames,
-                captured_at=captured_at,
+                captured_at=time.perf_counter(),
                 sequence=self.sequence,
             )
-            return captured_at, self.sequence
 
     def get_latest(self) -> CapturedFrame | None:
         with self.lock:
@@ -162,6 +195,45 @@ class LatestFrameBuffer:
                 frame_index=latest.frame_index,
                 total_frames=latest.total_frames,
                 captured_at=latest.captured_at,
+                sequence=latest.sequence,
+            )
+
+
+class LatestMaskBuffer:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.latest: MaskSnapshot | None = None
+        self.sequence = 0
+
+    def update(self, mask: np.ndarray, threshold: float, mode: str, blur_kernel: int) -> None:
+        with self.lock:
+            self.sequence += 1
+            self.latest = MaskSnapshot(
+                mask=mask.astype(np.float32, copy=True),
+                threshold=float(threshold),
+                mode=mode,
+                blur_kernel=int(blur_kernel),
+                sequence=self.sequence,
+            )
+
+    def set_visualization(self, threshold: float, mode: str, blur_kernel: int) -> None:
+        with self.lock:
+            if self.latest is None:
+                return
+            self.latest.threshold = float(threshold)
+            self.latest.mode = mode
+            self.latest.blur_kernel = int(blur_kernel)
+
+    def get_latest(self) -> MaskSnapshot | None:
+        with self.lock:
+            if self.latest is None:
+                return None
+            latest = self.latest
+            return MaskSnapshot(
+                mask=latest.mask.copy(),
+                threshold=latest.threshold,
+                mode=latest.mode,
+                blur_kernel=latest.blur_kernel,
                 sequence=latest.sequence,
             )
 
@@ -180,9 +252,95 @@ def get_yolo_world_cls():
         try:
             from ultralytics import YOLOWorld as YOLOWorldClass
         except ImportError as exc:  # pragma: no cover - optional backend.
-            raise RuntimeError("YOLO-World backend requires ultralytics. Install it with: pip install ultralytics") from exc
+            raise RuntimeError("YOLO-World backends require ultralytics. Install it with: pip install ultralytics") from exc
         YOLOWorld = YOLOWorldClass
     return YOLOWorld
+
+
+def get_yolo_cls():
+    global YOLO
+    if YOLO is None:
+        try:
+            from ultralytics import YOLO as YOLOClass
+        except ImportError as exc:  # pragma: no cover - optional backend.
+            raise RuntimeError("YOLO11n-seg backend requires ultralytics. Install it with: pip install ultralytics") from exc
+        YOLO = YOLOClass
+    return YOLO
+
+
+def prompt_to_classes(prompt: str) -> list[str]:
+    classes = [item.strip() for item in prompt.split(",") if item.strip()]
+    if not classes and prompt.strip():
+        classes = [prompt.strip()]
+    if not classes:
+        raise ValueError("Prompt must contain at least one target class")
+    return classes
+
+
+COCO_CLASS_ALIASES: dict[str, list[int]] = {
+    "person": [0],
+    "people": [0],
+    "human": [0],
+    "man": [0],
+    "woman": [0],
+    "pedestrian": [0],
+    "사람": [0],
+    "bicycle": [1],
+    "bike": [1],
+    "car": [2],
+    "vehicle": [1, 2, 3, 5, 7],
+    "자동차": [2],
+    "motorcycle": [3],
+    "bus": [5],
+    "truck": [7],
+    "cat": [15],
+    "dog": [16],
+    "강아지": [16],
+    "개": [16],
+    "animal": [14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
+}
+
+
+def coco_classes_for_prompt(prompt: str) -> list[int]:
+    normalized = normalize_prompt(prompt)
+    direct = COCO_CLASS_ALIASES.get(normalized)
+    if direct is not None:
+        return direct
+
+    classes: list[int] = []
+    for word in normalized.split():
+        classes.extend(COCO_CLASS_ALIASES.get(word, []))
+    if not classes:
+        supported = ", ".join(sorted(COCO_CLASS_ALIASES))
+        raise ValueError(f"YOLO11n-seg supports COCO class prompts only. Supported aliases: {supported}")
+    return sorted(set(classes))
+
+
+def normalize_prompt(prompt: str) -> str:
+    normalized = prompt.strip().lower().replace("_", " ").replace("-", " ")
+    words = [word for word in normalized.split() if word not in {"a", "an", "the"}]
+    return " ".join(words)
+
+
+def backend_unavailable_message(backend_name: str) -> str | None:
+    if backend_name in RUNNABLE_BACKENDS:
+        return None
+    if backend_name == BACKEND_YOLO_WORLD_SAM2:
+        return (
+            "YOLO-World + SAM2 tiny tracking is not runnable yet. "
+            "SAM2 runtime and a tiny checkpoint need to be added first."
+        )
+    if backend_name == BACKEND_SAM3:
+        return (
+            "SAM 3 is not runnable yet. "
+            "SAM 3 runtime and checkpoint need to be added first."
+        )
+    if backend_name == BACKEND_GDINO_SAM2:
+        return (
+            "Grounding DINO tiny + SAM2 tiny is not runnable yet. "
+            "Grounding DINO, SAM2, and tiny checkpoints need to be added first."
+        )
+    return f"Unsupported backend: {backend_name}"
 
 
 def bgr_to_qimage(frame: np.ndarray) -> QImage:
@@ -196,15 +354,11 @@ def resize_frame_for_display(frame: np.ndarray, max_dimension: int = DISPLAY_MAX
     height, width = frame.shape[:2]
     largest = max(height, width)
     if largest <= max_dimension:
-        return frame.copy()
+        return frame
     scale = max_dimension / largest
     resized_width = max(1, round(width * scale))
     resized_height = max(1, round(height * scale))
     return cv2.resize(frame, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
-
-
-def round_up_to_stride(value: int, stride: int) -> int:
-    return max(stride, ((value + stride - 1) // stride) * stride)
 
 
 def parse_float_csv(text: str, minimum: float, maximum: float, label: str) -> list[float]:
@@ -225,6 +379,31 @@ def parse_float_csv(text: str, minimum: float, maximum: float, label: str) -> li
     return list(dict.fromkeys(values))
 
 
+def parse_int_csv(text: str, minimum: int, maximum: int, label: str) -> list[int]:
+    values: list[int] = []
+    for raw_item in text.split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        try:
+            value = int(item)
+        except ValueError as exc:
+            raise ValueError(f"{label} contains a non-integer: {item!r}") from exc
+        if not minimum <= value <= maximum:
+            raise ValueError(f"{label} value {value:d} is outside [{minimum:d}, {maximum:d}]")
+        values.append(value)
+    if not values:
+        raise ValueError(f"{label} must contain at least one value")
+    return list(dict.fromkeys(values))
+
+
+def parse_text_csv(text: str, label: str) -> list[str]:
+    values = [item.strip() for item in text.split(",") if item.strip()]
+    if not values:
+        raise ValueError(f"{label} must contain at least one value")
+    return list(dict.fromkeys(values))
+
+
 def apply_effect(frame: np.ndarray, mask: np.ndarray, threshold: float, mode: str, blur_kernel: int) -> np.ndarray:
     binary = mask >= threshold
     if mode == "mask":
@@ -240,25 +419,17 @@ def apply_effect(frame: np.ndarray, mask: np.ndarray, threshold: float, mode: st
     return np.where(binary[..., None], frame, background)
 
 
-def resize_mask_to_frame(mask: np.ndarray, frame: np.ndarray) -> np.ndarray:
+def overlay_effect_mask(
+    frame: np.ndarray,
+    mask: np.ndarray,
+    threshold: float,
+    mode: str,
+    blur_kernel: int,
+) -> np.ndarray:
     height, width = frame.shape[:2]
-    if mask.shape[:2] == (height, width):
-        return mask
-    return cv2.resize(mask, (width, height), interpolation=cv2.INTER_LINEAR).astype(np.float32)
-
-
-def apply_mask_overlay(frame: np.ndarray, mask: np.ndarray, threshold: float, mode: str, blur_kernel: int) -> np.ndarray:
-    resized_mask = resize_mask_to_frame(mask, frame)
-    output = apply_effect(frame, resized_mask, threshold, mode, blur_kernel)
-    if mode == "mask":
-        return output
-
-    alpha = np.clip(resized_mask, 0.0, 1.0) * 0.35
-    binary = resized_mask >= threshold
-    overlay = output.copy()
-    overlay[binary] = (40, 220, 120)
-    blended = output.astype(np.float32) * (1.0 - alpha[..., None]) + overlay.astype(np.float32) * alpha[..., None]
-    return np.clip(blended, 0, 255).astype(np.uint8)
+    if mask.shape[:2] != (height, width):
+        mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_LINEAR)
+    return apply_effect(frame, mask, threshold, mode, blur_kernel)
 
 
 def binary_confusion_counts(prediction: np.ndarray, target: np.ndarray) -> tuple[int, int, int, int]:
@@ -288,66 +459,104 @@ def read_gt_mask(path: Path, width: int, height: int) -> np.ndarray:
     return mask > 0
 
 
+def fit_table_to_panel(table: QTableWidget, default_section_size: int = 72) -> None:
+    table.setSizeAdjustPolicy(QAbstractScrollArea.AdjustIgnored)
+    table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+    table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+    table.setWordWrap(False)
+    table.setMinimumWidth(0)
+    header = table.horizontalHeader()
+    header.setSectionResizeMode(QHeaderView.Interactive)
+    header.setStretchLastSection(False)
+    header.setDefaultSectionSize(default_section_size)
+
+
 class PromptSegmenter:
-    def __init__(self, model_name: str, device: str) -> None:
-        self.model_name = model_name
+    def __init__(self, backend_name: str, device: str) -> None:
+        self.model_name = backend_name
         self.device = torch.device(device)
         self.processor: CLIPSegProcessor | None = None
         self.model: CLIPSegForImageSegmentation | None = None
-        self.yolo_model_name = YOLO_WORLD_MODEL
         self.yolo_model = None
-        self.yolo_classes: list[str] | None = None
+        self.yolo_seg_model = None
         self.lock = threading.Lock()
 
     def load(self) -> None:
+        if self.model_name == BACKEND_YOLO11N_SEG:
+            self.load_yolo11n_seg()
+            return
+        if self.model_name != BACKEND_CLIPSEG:
+            self.load_yolo_world() if self.model_name == BACKEND_YOLO_WORLD_BOX else self.ensure_backend_available()
+            return
         if self.model is not None and self.processor is not None:
             return
         with self.lock:
             if self.model is not None and self.processor is not None:
                 return
-            self.processor = CLIPSegProcessor.from_pretrained(self.model_name)
-            self.model = CLIPSegForImageSegmentation.from_pretrained(self.model_name).to(self.device)
+            self.processor = CLIPSegProcessor.from_pretrained(CLIPSEG_MODEL_NAME)
+            self.model = CLIPSegForImageSegmentation.from_pretrained(CLIPSEG_MODEL_NAME).to(self.device)
             self.model.eval()
             if self.device.type == "cuda":
                 torch.backends.cudnn.benchmark = True
 
-    def load_yolo_world(self, prompt: str) -> None:
-        classes = [item.strip() for item in prompt.split(",") if item.strip()]
-        if not classes:
-            raise ValueError("YOLO-World prompt must contain at least one class name")
-        yolo_world_cls = get_yolo_world_cls()
+    def load_yolo_world(self) -> None:
+        if self.yolo_model is not None:
+            return
         with self.lock:
-            if self.yolo_model is None:
-                self.yolo_model = yolo_world_cls(self.yolo_model_name)
-            if self.yolo_classes != classes:
-                self.yolo_model.set_classes(classes)
-                self.yolo_classes = classes
+            if self.yolo_model is not None:
+                return
+            yolo_cls = get_yolo_world_cls()
+            self.yolo_model = yolo_cls(YOLO_WORLD_MODEL)
+
+    def load_yolo11n_seg(self) -> None:
+        if self.yolo_seg_model is not None:
+            return
+        with self.lock:
+            if self.yolo_seg_model is not None:
+                return
+            yolo_cls = get_yolo_cls()
+            self.yolo_seg_model = yolo_cls(YOLO11N_SEG_MODEL)
+
+    def ensure_backend_available(self) -> None:
+        message = backend_unavailable_message(self.model_name)
+        if message is not None:
+            raise RuntimeError(message)
 
     def set_model(self, model_name: str, device: str) -> None:
         model_name = model_name.strip()
         if not model_name:
-            raise ValueError("Model name cannot be empty")
+            raise ValueError("Backend name cannot be empty")
+        if model_name not in BACKEND_PRESETS:
+            raise ValueError(f"Unsupported backend: {model_name}")
         with self.lock:
             self.processor = None
             self.model = None
             self.yolo_model = None
-            self.yolo_classes = None
+            self.yolo_seg_model = None
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
             self.model_name = model_name
             self.device = torch.device(device)
+        gc.collect()
 
-    def set_yolo_model(self, model_name: str) -> None:
-        model_name = model_name.strip()
-        if not model_name:
-            raise ValueError("YOLO model name cannot be empty")
+    def close(self) -> None:
         with self.lock:
+            self.processor = None
+            self.model = None
             self.yolo_model = None
-            self.yolo_classes = None
-            self.yolo_model_name = model_name
+            self.yolo_seg_model = None
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
 
     @torch.inference_mode()
     def predict_mask(self, frame: np.ndarray, prompt: str, infer_scale: float) -> tuple[np.ndarray, float]:
+        if self.model_name == BACKEND_YOLO11N_SEG:
+            return self.predict_yolo11n_seg_mask(frame, prompt, infer_scale)
+        if self.model_name == BACKEND_YOLO_WORLD_BOX:
+            return self.predict_yolo_world_box_mask(frame, prompt, infer_scale)
+        if self.model_name != BACKEND_CLIPSEG:
+            self.ensure_backend_available()
         self.load()
         assert self.processor is not None
         assert self.model is not None
@@ -384,10 +593,11 @@ class PromptSegmenter:
         return mask.astype(np.float32), model_latency_ms
 
     @torch.inference_mode()
-    def predict_yolo_world_mask(self, frame: np.ndarray, prompt: str, infer_scale: float) -> tuple[np.ndarray, float]:
-        self.load_yolo_world(prompt)
+    def predict_yolo_world_box_mask(self, frame: np.ndarray, prompt: str, infer_scale: float) -> tuple[np.ndarray, float]:
+        self.load_yolo_world()
         assert self.yolo_model is not None
 
+        classes = prompt_to_classes(prompt)
         height, width = frame.shape[:2]
         scale = min(1.0, max(0.05, infer_scale))
         if scale < 1.0:
@@ -395,11 +605,48 @@ class PromptSegmenter:
         else:
             resized = frame
 
-        image_size = round_up_to_stride(max(resized.shape[:2]), YOLO_IMAGE_STRIDE)
+        self.yolo_model.set_classes(classes)
         started = time.perf_counter()
-        results = self.yolo_model.predict(
-            resized,
-            imgsz=image_size,
+        results = self.yolo_model.predict(resized, verbose=False)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        model_latency_ms = (time.perf_counter() - started) * 1000.0
+
+        mask = np.zeros((height, width), dtype=np.float32)
+        if not results:
+            return mask, model_latency_ms
+        boxes = getattr(results[0], "boxes", None)
+        if boxes is None or boxes.xyxy is None:
+            return mask, model_latency_ms
+        xyxy = boxes.xyxy.detach().cpu().numpy()
+        inv_scale = 1.0 / scale
+        for x1, y1, x2, y2 in xyxy:
+            left = int(max(0, round(x1 * inv_scale)))
+            top = int(max(0, round(y1 * inv_scale)))
+            right = int(min(width, round(x2 * inv_scale)))
+            bottom = int(min(height, round(y2 * inv_scale)))
+            if right > left and bottom > top:
+                mask[top:bottom, left:right] = 1.0
+        return mask, model_latency_ms
+
+    @torch.inference_mode()
+    def predict_yolo11n_seg_mask(self, frame: np.ndarray, prompt: str, infer_scale: float) -> tuple[np.ndarray, float]:
+        self.load_yolo11n_seg()
+        assert self.yolo_seg_model is not None
+
+        class_ids = coco_classes_for_prompt(prompt)
+        height, width = frame.shape[:2]
+        scale = min(1.0, max(0.05, infer_scale))
+        imgsz = max(320, int(round(max(width, height) * scale)))
+
+        started = time.perf_counter()
+        results = self.yolo_seg_model.predict(
+            frame,
+            imgsz=imgsz,
+            conf=0.25,
+            iou=0.7,
+            classes=class_ids,
+            retina_masks=True,
             device=str(self.device),
             verbose=False,
         )
@@ -408,44 +655,35 @@ class PromptSegmenter:
         model_latency_ms = (time.perf_counter() - started) * 1000.0
 
         mask = np.zeros((height, width), dtype=np.float32)
-        if not results:
+        if not results or results[0].masks is None:
             return mask, model_latency_ms
-        boxes = results[0].boxes
-        if boxes is None or boxes.xyxy is None:
-            return mask, model_latency_ms
-
-        xyxy = boxes.xyxy.detach().cpu().numpy()
-        if scale < 1.0:
-            xyxy = xyxy / scale
-        for x1, y1, x2, y2 in xyxy:
-            left = max(0, min(width, int(round(x1))))
-            top = max(0, min(height, int(round(y1))))
-            right = max(0, min(width, int(round(x2))))
-            bottom = max(0, min(height, int(round(y2))))
-            if right > left and bottom > top:
-                mask[top:bottom, left:right] = 1.0
-        return mask, model_latency_ms
-
-    def predict(self, frame: np.ndarray, prompt: str, infer_scale: float, backend: str) -> tuple[np.ndarray, float]:
-        if backend == "YOLO-World box":
-            return self.predict_yolo_world_mask(frame, prompt, infer_scale)
-        return self.predict_mask(frame, prompt, infer_scale)
+        raw_masks = results[0].masks.data.detach().cpu().numpy()
+        for raw_mask in raw_masks:
+            mask_part = raw_mask.astype(np.float32)
+            if mask_part.shape != (height, width):
+                mask_part = cv2.resize(mask_part, (width, height), interpolation=cv2.INTER_LINEAR)
+            mask = np.maximum(mask, mask_part)
+        return np.clip(mask, 0.0, 1.0).astype(np.float32), model_latency_ms
 
 
 class CaptureWorker(QThread):
-    display_frame = Signal(object)
+    input_frame = Signal(QImage)
+    output_frame = Signal(QImage)
     status = Signal(str)
     position_changed = Signal(int, int)
     video_info = Signal(int, float)
 
-    def __init__(self, frame_buffer: LatestFrameBuffer) -> None:
+    def __init__(self, frame_buffer: LatestFrameBuffer, mask_buffer: LatestMaskBuffer) -> None:
         super().__init__()
         self.frame_buffer = frame_buffer
+        self.mask_buffer = mask_buffer
         self.source: int | str = 0
         self.running = False
         self.paused = False
         self.seek_frame: int | None = None
         self.control_lock = threading.Lock()
+        self.cap: cv2.VideoCapture | None = None
+        self.cap_lock = threading.Lock()
 
     def set_source(self, source: int | str) -> None:
         self.source = source
@@ -455,6 +693,9 @@ class CaptureWorker(QThread):
 
     def stop(self) -> None:
         self.running = False
+        with self.cap_lock:
+            if self.cap is not None:
+                self.cap.release()
 
     def pause(self) -> None:
         with self.control_lock:
@@ -472,8 +713,14 @@ class CaptureWorker(QThread):
         self.running = True
         cap = cv2.VideoCapture(self.source)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        with self.cap_lock:
+            self.cap = cap
         if not cap.isOpened():
             self.status.emit(f"Could not open source: {self.source}")
+            with self.cap_lock:
+                if self.cap is cap:
+                    self.cap = None
+            cap.release()
             return
 
         frame_index = 0
@@ -504,21 +751,28 @@ class CaptureWorker(QThread):
             if not ok:
                 break
 
-            captured_at, sequence = self.frame_buffer.update(frame, frame_index, total_frames)
+            self.frame_buffer.update(frame, frame_index, total_frames)
             now = time.perf_counter()
             should_emit_display = now - last_display_emit >= display_interval or requested_seek is not None
             should_emit_position = now - last_position_emit >= position_interval or should_emit_display
             if should_emit_display:
                 preview_frame = resize_frame_for_display(frame)
-                self.display_frame.emit(
-                    CapturedFrame(
-                        frame=preview_frame,
-                        frame_index=frame_index,
-                        total_frames=total_frames,
-                        captured_at=captured_at,
-                        sequence=sequence,
+                self.input_frame.emit(bgr_to_qimage(preview_frame))
+                mask_snapshot = self.mask_buffer.get_latest()
+                if mask_snapshot is None:
+                    self.output_frame.emit(bgr_to_qimage(preview_frame))
+                else:
+                    self.output_frame.emit(
+                        bgr_to_qimage(
+                            overlay_effect_mask(
+                                preview_frame,
+                                mask_snapshot.mask,
+                                mask_snapshot.threshold,
+                                mask_snapshot.mode,
+                                mask_snapshot.blur_kernel,
+                            )
+                        )
                     )
-                )
                 last_display_emit = now
             if should_emit_position:
                 self.position_changed.emit(frame_index, total_frames)
@@ -531,19 +785,27 @@ class CaptureWorker(QThread):
                 if spent < frame_interval:
                     time.sleep(frame_interval - spent)
 
+        with self.cap_lock:
+            if self.cap is cap:
+                self.cap = None
         cap.release()
         self.status.emit("capture stopped")
 
 
 class InferenceWorker(QThread):
-    mask_result = Signal(object)
     metrics = Signal(object)
     status = Signal(str)
 
-    def __init__(self, segmenter: PromptSegmenter, frame_buffer: LatestFrameBuffer) -> None:
+    def __init__(
+        self,
+        segmenter: PromptSegmenter,
+        frame_buffer: LatestFrameBuffer,
+        mask_buffer: LatestMaskBuffer,
+    ) -> None:
         super().__init__()
         self.segmenter = segmenter
         self.frame_buffer = frame_buffer
+        self.mask_buffer = mask_buffer
         self.settings = RuntimeSettings()
         self.settings_lock = threading.Lock()
         self.running = False
@@ -573,24 +835,18 @@ class InferenceWorker(QThread):
             with self.settings_lock:
                 settings = RuntimeSettings(**self.settings.__dict__)
 
-            should_process = captured.frame_index % max(1, settings.frame_stride) == 0
+            process_interval = max(1, settings.skip_frames + 1)
+            should_process = captured.frame_index % process_interval == 0
             if should_process and settings.prompt.strip():
                 started = time.perf_counter()
                 try:
-                    mask, model_latency_ms = self.segmenter.predict(
+                    mask, model_latency_ms = self.segmenter.predict_mask(
                         captured.frame,
                         settings.prompt.strip(),
                         settings.infer_scale,
-                        settings.backend,
                     )
+                    self.mask_buffer.update(mask, settings.threshold, settings.mode, settings.blur_kernel)
                     processed += 1
-                    self.mask_result.emit(
-                        MaskResult(
-                            mask=mask,
-                            frame_shape=captured.frame.shape[:2],
-                            sequence=captured.sequence,
-                        )
-                    )
                     now = time.perf_counter()
                     fps = 1.0 / max(1e-6, now - last_emit)
                     last_emit = now
@@ -607,6 +863,7 @@ class InferenceWorker(QThread):
                     )
                 except Exception as exc:
                     self.status.emit(str(exc))
+                    self.running = False
             else:
                 skipped += 1
 
@@ -629,38 +886,49 @@ class SweepWorker(QThread):
         self.frame = frame
         self.settings = settings
         self.sweep_config = sweep_config
-        self.running = False
-
-    def stop(self) -> None:
-        self.running = False
 
     def run(self) -> None:
         try:
-            self.running = True
             results = []
-            for infer_scale in self.sweep_config.scales:
-                for threshold in self.sweep_config.thresholds:
-                    if not self.running:
-                        self.status.emit("Sweep stopped")
-                        return
-                    started = time.perf_counter()
-                    mask, model_latency_ms = self.segmenter.predict(
-                        self.frame,
-                        self.settings.prompt,
-                        infer_scale,
-                        self.settings.backend,
-                    )
-                    _ = apply_effect(self.frame, mask, threshold, self.settings.mode, self.settings.blur_kernel)
-                    total_ms = (time.perf_counter() - started) * 1000.0
-                    results.append(
-                        {
-                            "infer_scale": infer_scale,
-                            "threshold": threshold,
-                            "latency_ms": total_ms,
-                            "model_latency_ms": model_latency_ms,
-                            "mask_coverage": float((mask >= threshold).mean()),
-                        }
-                    )
+            original_model = self.segmenter.model_name
+            device_name = str(self.segmenter.device)
+            try:
+                for model_id in self.sweep_config.model_ids:
+                    if self.segmenter.model_name != model_id:
+                        self.segmenter.set_model(model_id, device_name)
+                    for prompt in self.sweep_config.prompts:
+                        for skip_frames in self.sweep_config.skip_frames:
+                            for infer_scale in self.sweep_config.scales:
+                                for threshold in self.sweep_config.thresholds:
+                                    started = time.perf_counter()
+                                    mask, model_latency_ms = self.segmenter.predict_mask(
+                                        self.frame,
+                                        prompt,
+                                        infer_scale,
+                                    )
+                                    _ = apply_effect(
+                                        self.frame,
+                                        mask,
+                                        threshold,
+                                        self.settings.mode,
+                                        self.settings.blur_kernel,
+                                    )
+                                    total_ms = (time.perf_counter() - started) * 1000.0
+                                    results.append(
+                                        {
+                                            "model_id": model_id,
+                                            "prompt": prompt,
+                                            "skip_frames": skip_frames,
+                                            "infer_scale": infer_scale,
+                                            "threshold": threshold,
+                                            "latency_ms": total_ms,
+                                            "model_latency_ms": model_latency_ms,
+                                            "mask_coverage": float((mask >= threshold).mean()),
+                                        }
+                                    )
+            finally:
+                if self.segmenter.model_name != original_model:
+                    self.segmenter.set_model(original_model, device_name)
             self.finished_with_results.emit(results)
         except Exception as exc:
             self.status.emit(str(exc))
@@ -685,14 +953,9 @@ class BenchmarkWorker(QThread):
         self.settings = settings
         self.max_frames = max_frames
         self.sweep_config = sweep_config
-        self.running = False
-
-    def stop(self) -> None:
-        self.running = False
 
     def run(self) -> None:
         try:
-            self.running = True
             if not CAMVID_VIDEO.exists() or not CAMVID_GT_DIR.exists():
                 raise RuntimeError("CamVid benchmark files not found. Run benchmark/prepare_camvid_benchmark.py first.")
 
@@ -720,57 +983,85 @@ class BenchmarkWorker(QThread):
 
             results = []
             combinations = [
-                (scale, threshold)
+                (model_id, prompt, skip_frames, scale, threshold)
+                for model_id in self.sweep_config.model_ids
+                for prompt in self.sweep_config.prompts
+                for skip_frames in self.sweep_config.skip_frames
                 for scale in self.sweep_config.scales
                 for threshold in self.sweep_config.thresholds
             ]
             total_combinations = len(combinations)
-            for combo_index, (infer_scale, threshold) in enumerate(combinations, start=1):
-                if not self.running:
-                    self.status.emit("Benchmark stopped")
-                    return
-                self.progress.emit(
-                    combo_index,
-                    total_combinations,
-                    f"scale={infer_scale:.2f}, threshold={threshold:.2f}",
-                )
-                tp_total = fp_total = tn_total = fn_total = 0
-                latencies = []
-                started = time.perf_counter()
-                for frame_offset, (frame, gt_mask) in enumerate(zip(frames, gt_masks)):
-                    if not self.running:
-                        self.status.emit("Benchmark stopped")
-                        return
-                    mask, model_latency_ms = self.segmenter.predict(
-                        frame,
-                        self.settings.prompt,
-                        infer_scale,
-                        self.settings.backend,
+            original_model = self.segmenter.model_name
+            device_name = str(self.segmenter.device)
+            try:
+                for combo_index, (model_id, prompt, skip_frames, infer_scale, threshold) in enumerate(
+                    combinations,
+                    start=1,
+                ):
+                    if self.segmenter.model_name != model_id:
+                        self.segmenter.set_model(model_id, device_name)
+                    self.progress.emit(
+                        combo_index,
+                        total_combinations,
+                        (
+                            f"backend={model_id}, prompt={prompt}, skip={skip_frames}, "
+                            f"scale={infer_scale:.2f}, threshold={threshold:.2f}"
+                        ),
                     )
-                    output = apply_effect(frame, mask, threshold, self.settings.mode, self.settings.blur_kernel)
-                    self.preview.emit(bgr_to_qimage(frame), bgr_to_qimage(output))
-                    latencies.append(model_latency_ms)
-                    tp, fp, tn, fn = binary_confusion_counts(mask >= threshold, gt_mask)
-                    tp_total += tp
-                    fp_total += fp
-                    tn_total += tn
-                    fn_total += fn
-                elapsed = time.perf_counter() - started
-                leakage, damage = metric_rates(tp_total, fp_total, tn_total, fn_total)
-                row = {
-                    "infer_scale": infer_scale,
-                    "threshold": threshold,
-                    "non_target_leakage": leakage,
-                    "target_damage": damage,
-                    "fps": float(len(frames) / elapsed) if elapsed > 0 else 0.0,
-                    "latency_ms": float(np.mean(latencies)) if latencies else 0.0,
-                    "tp": tp_total,
-                    "fp": fp_total,
-                    "tn": tn_total,
-                    "fn": fn_total,
-                }
-                results.append(row)
-                self.row_ready.emit(row)
+                    tp_total = fp_total = tn_total = fn_total = 0
+                    latencies = []
+                    model_calls = 0
+                    latest_mask: np.ndarray | None = None
+                    process_interval = max(1, skip_frames + 1)
+                    started = time.perf_counter()
+                    for frame_offset, (frame, gt_mask) in enumerate(zip(frames, gt_masks)):
+                        should_process = frame_offset % process_interval == 0 or latest_mask is None
+                        if should_process:
+                            latest_mask, model_latency_ms = self.segmenter.predict_mask(
+                                frame,
+                                prompt,
+                                infer_scale,
+                            )
+                            latencies.append(model_latency_ms)
+                            model_calls += 1
+                        assert latest_mask is not None
+                        output = apply_effect(
+                            frame,
+                            latest_mask,
+                            threshold,
+                            self.settings.mode,
+                            self.settings.blur_kernel,
+                        )
+                        self.preview.emit(bgr_to_qimage(frame), bgr_to_qimage(output))
+                        tp, fp, tn, fn = binary_confusion_counts(latest_mask >= threshold, gt_mask)
+                        tp_total += tp
+                        fp_total += fp
+                        tn_total += tn
+                        fn_total += fn
+                    elapsed = time.perf_counter() - started
+                    leakage, damage = metric_rates(tp_total, fp_total, tn_total, fn_total)
+                    row = {
+                        "model_id": model_id,
+                        "prompt": prompt,
+                        "skip_frames": skip_frames,
+                        "infer_scale": infer_scale,
+                        "threshold": threshold,
+                        "non_target_leakage": leakage,
+                        "target_damage": damage,
+                        "fps": float(len(frames) / elapsed) if elapsed > 0 else 0.0,
+                        "latency_ms": float((elapsed / len(frames)) * 1000.0) if frames else 0.0,
+                        "model_latency_ms": float(np.mean(latencies)) if latencies else 0.0,
+                        "model_calls": model_calls,
+                        "tp": tp_total,
+                        "fp": fp_total,
+                        "tn": tn_total,
+                        "fn": fn_total,
+                    }
+                    results.append(row)
+                    self.row_ready.emit(row)
+            finally:
+                if self.segmenter.model_name != original_model:
+                    self.segmenter.set_model(original_model, device_name)
             self.finished_with_results.emit(results)
         except Exception as exc:
             self.status.emit(str(exc))
@@ -813,17 +1104,15 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.segmenter = segmenter
         self.frame_buffer: LatestFrameBuffer | None = None
+        self.mask_buffer: LatestMaskBuffer | None = None
         self.capture_worker: CaptureWorker | None = None
         self.inference_worker: InferenceWorker | None = None
         self.active_source: int | str | None = None
         self.sweep_worker: SweepWorker | None = None
         self.benchmark_worker: BenchmarkWorker | None = None
-        self.latest_display_frame: np.ndarray | None = None
-        self.latest_mask_result: MaskResult | None = None
+        self.retiring_threads: list[QThread] = []
         self.latest_sweep_results: list[dict] = []
         self.latest_benchmark_results: list[dict] = []
-        self.processed_render_pending = False
-        self.last_processed_render_at = 0.0
 
         self.setWindowTitle("Focus On You - Real-time Prompt Segmentation MVP")
         self.resize(1360, 860)
@@ -888,24 +1177,9 @@ class MainWindow(QMainWindow):
         model_box = QGroupBox("Model")
         model_form = QFormLayout(model_box)
         self.model_name = QComboBox()
-        self.model_name.setEditable(True)
-        self.model_name.addItems(
-            [
-                "CIDAS/clipseg-rd64-refined",
-                "CIDAS/clipseg-rd64",
-                "CIDAS/clipseg-rd16",
-            ]
-        )
+        self.model_name.setEditable(False)
+        self.model_name.addItems(BACKEND_PRESETS)
         self.model_name.setCurrentText(self.segmenter.model_name)
-        self.yolo_model_name = QComboBox()
-        self.yolo_model_name.setEditable(True)
-        self.yolo_model_name.addItems(
-            [
-                YOLO_WORLD_MODEL,
-                "yolov8m-world.pt",
-            ]
-        )
-        self.yolo_model_name.setCurrentText(self.segmenter.yolo_model_name)
         self.device_name = QComboBox()
         devices = ["cpu"]
         if torch.cuda.is_available():
@@ -915,10 +1189,13 @@ class MainWindow(QMainWindow):
         self.device_name.addItems(devices)
         self.device_name.setCurrentText(str(self.segmenter.device))
         self.apply_model_button = QPushButton("Apply Model")
-        model_form.addRow("CLIPSeg model ID", self.model_name)
-        model_form.addRow("YOLO-World model ID", self.yolo_model_name)
+        self.current_backend_label = QLabel()
+        self.current_backend_label.setWordWrap(True)
+        self.current_backend_label.setStyleSheet("color: #47c2ff; font-weight: 700;")
+        model_form.addRow("Backend", self.model_name)
         model_form.addRow("Device", self.device_name)
         model_form.addRow(self.apply_model_button)
+        model_form.addRow("Current", self.current_backend_label)
         controls.addWidget(model_box)
 
         source_box = QGroupBox("Source Controls")
@@ -959,9 +1236,6 @@ class MainWindow(QMainWindow):
 
         prompt_box = QGroupBox("Prompt & Effect")
         prompt_form = QFormLayout(prompt_box)
-        self.backend = QComboBox()
-        self.backend.addItems(["CLIPSeg mask", "YOLO-World box"])
-        self.backend.setCurrentText(DEFAULT_SETTINGS["backend"])
         self.prompt = QLineEdit(DEFAULT_SETTINGS["prompt"])
         self.mode = QComboBox()
         self.mode.addItems(["blur", "remove", "dim", "mask"])
@@ -976,7 +1250,6 @@ class MainWindow(QMainWindow):
         self.blur_kernel.setRange(3, 99)
         self.blur_kernel.setSingleStep(2)
         self.blur_kernel.setValue(DEFAULT_SETTINGS["blur_kernel"])
-        prompt_form.addRow("Backend", self.backend)
         prompt_form.addRow("Target prompt", self.prompt)
         prompt_form.addRow("Mode", self.mode)
         prompt_form.addRow("Threshold", threshold_row)
@@ -988,23 +1261,31 @@ class MainWindow(QMainWindow):
         self.infer_scale = QComboBox()
         self.infer_scale.addItems(["0.25", "0.50", "0.75", "1.00"])
         self.infer_scale.setCurrentText(DEFAULT_SETTINGS["infer_scale"])
-        self.frame_stride = QSpinBox()
-        self.frame_stride.setRange(1, 30)
-        self.frame_stride.setValue(DEFAULT_SETTINGS["frame_stride"])
+        self.skip_frames = QSpinBox()
+        self.skip_frames.setRange(0, 30)
+        self.skip_frames.setValue(DEFAULT_SETTINGS["skip_frames"])
         self.reset_hyperparams_button = QPushButton("Reset Hyperparameters")
         realtime_form.addRow("Inference scale", self.infer_scale)
-        realtime_form.addRow("Process every N frames", self.frame_stride)
+        realtime_form.addRow("Skip frames", self.skip_frames)
         realtime_form.addRow(self.reset_hyperparams_button)
         controls.addWidget(realtime_box)
 
         sweep_space_box = QGroupBox("Sweep Space")
         sweep_space_form = QFormLayout(sweep_space_box)
+        self.sweep_prompts = QLineEdit(DEFAULT_SETTINGS["sweep_prompts"])
+        self.sweep_models = QComboBox()
+        self.sweep_models.addItems(BACKEND_PRESETS)
+        self.sweep_models.setCurrentText(DEFAULT_SETTINGS["sweep_models"])
         self.sweep_scales = QLineEdit(DEFAULT_SETTINGS["sweep_scales"])
         self.sweep_thresholds = QLineEdit(DEFAULT_SETTINGS["sweep_thresholds"])
+        self.sweep_skip_frames = QLineEdit(DEFAULT_SETTINGS["sweep_skip_frames"])
         self.sweep_estimate = QLabel("")
         self.sweep_estimate.setWordWrap(True)
-        sweep_space_form.addRow("Scales CSV", self.sweep_scales)
-        sweep_space_form.addRow("Thresholds CSV", self.sweep_thresholds)
+        sweep_space_form.addRow("Target prompts", self.sweep_prompts)
+        sweep_space_form.addRow("Backend", self.sweep_models)
+        sweep_space_form.addRow("Scales", self.sweep_scales)
+        sweep_space_form.addRow("Thresholds", self.sweep_thresholds)
+        sweep_space_form.addRow("Skip frames", self.sweep_skip_frames)
         sweep_space_form.addRow("Combinations", self.sweep_estimate)
         controls.addWidget(sweep_space_box)
 
@@ -1016,8 +1297,9 @@ class MainWindow(QMainWindow):
         sweep_button_row = QHBoxLayout()
         sweep_button_row.addWidget(self.sweep_button)
         sweep_button_row.addWidget(self.save_sweep_button)
-        self.sweep_table = QTableWidget(0, 4)
-        self.sweep_table.setHorizontalHeaderLabels(["scale", "thr", "lat ms", "coverage"])
+        self.sweep_table = QTableWidget(0, 7)
+        self.sweep_table.setHorizontalHeaderLabels(["backend", "prompt", "skip", "scale", "thr", "lat ms", "coverage"])
+        fit_table_to_panel(self.sweep_table)
         self.sweep_table.setMinimumHeight(120)
         self.sweep_table.setMaximumHeight(170)
         sweep_layout.addLayout(sweep_button_row)
@@ -1038,8 +1320,13 @@ class MainWindow(QMainWindow):
         self.benchmark_progress.setValue(0)
         self.benchmark_progress.setTextVisible(True)
         self.benchmark_progress_label = QLabel("idle")
-        self.benchmark_table = QTableWidget(0, 6)
-        self.benchmark_table.setHorizontalHeaderLabels(["scale", "thr", "leak", "damage", "FPS", "lat ms"])
+        self.benchmark_progress_label.setWordWrap(True)
+        self.benchmark_progress_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.benchmark_table = QTableWidget(0, 9)
+        self.benchmark_table.setHorizontalHeaderLabels(
+            ["backend", "prompt", "skip", "scale", "thr", "leak", "damage", "FPS", "lat ms"]
+        )
+        fit_table_to_panel(self.benchmark_table, default_section_size=68)
         self.benchmark_table.setMinimumHeight(150)
         self.benchmark_table.setMaximumHeight(210)
         benchmark_form = QFormLayout()
@@ -1054,11 +1341,32 @@ class MainWindow(QMainWindow):
         benchmark_layout.addWidget(self.benchmark_table)
         controls.addWidget(benchmark_box)
 
-        self.status_label = QLabel(f"Device: {self.segmenter.device}. Model loads on first inference.")
+        self.hyperparameter_controls = [
+            self.model_name,
+            self.device_name,
+            self.apply_model_button,
+            self.prompt,
+            self.mode,
+            self.threshold,
+            self.blur_kernel,
+            self.infer_scale,
+            self.skip_frames,
+            self.reset_hyperparams_button,
+            self.sweep_prompts,
+            self.sweep_models,
+            self.sweep_scales,
+            self.sweep_thresholds,
+            self.sweep_skip_frames,
+            self.sweep_button,
+            self.benchmark_frames,
+        ]
+
+        self.status_label = QLabel(f"Device: {self.segmenter.device}. Backend loads on first inference.")
         self.status_label.setWordWrap(True)
         controls.addWidget(self.status_label)
         controls.addStretch(1)
         self.update_sweep_estimate()
+        self.update_current_backend_label()
 
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self.close)
@@ -1079,15 +1387,19 @@ class MainWindow(QMainWindow):
         self.save_sweep_button.clicked.connect(self.save_sweep_results)
         self.benchmark_button.clicked.connect(self.run_benchmark)
         self.save_benchmark_button.clicked.connect(self.save_benchmark_results)
+        self.sweep_prompts.textChanged.connect(self.update_sweep_estimate)
+        self.sweep_models.currentTextChanged.connect(self.update_sweep_estimate)
         self.sweep_scales.textChanged.connect(self.update_sweep_estimate)
         self.sweep_thresholds.textChanged.connect(self.update_sweep_estimate)
+        self.sweep_skip_frames.textChanged.connect(self.update_sweep_estimate)
         self.benchmark_frames.valueChanged.connect(self.update_sweep_estimate)
+        self.model_name.currentTextChanged.connect(self.on_backend_selection_changed)
+        self.device_name.currentTextChanged.connect(lambda: self.update_current_backend_label(pending=True))
         for widget in [
-            self.backend,
             self.prompt,
             self.mode,
             self.infer_scale,
-            self.frame_stride,
+            self.skip_frames,
             self.blur_kernel,
         ]:
             if isinstance(widget, QLineEdit):
@@ -1114,21 +1426,42 @@ class MainWindow(QMainWindow):
             """
         )
 
+    @Slot(str)
+    def on_backend_selection_changed(self, backend_name: str) -> None:
+        self.update_sweep_estimate()
+        if backend_name == BACKEND_YOLO11N_SEG and self.prompt.text().strip().lower() == "road":
+            self.prompt.setText("person")
+        self.update_current_backend_label(pending=True)
+
+    def update_current_backend_label(self, *, pending: bool = False) -> None:
+        if pending:
+            self.current_backend_label.setText(
+                f"Pending: {self.model_name.currentText()} / {self.device_name.currentText()}"
+            )
+            return
+        self.current_backend_label.setText(f"{self.segmenter.model_name} / {self.segmenter.device}")
+
     def current_settings(self) -> RuntimeSettings:
         return RuntimeSettings(
             prompt=self.prompt.text().strip() or "target",
-            backend=self.backend.currentText(),
             mode=self.mode.currentText(),
             threshold=self.threshold.value() / 100.0,
             infer_scale=float(self.infer_scale.currentText()),
             blur_kernel=self.blur_kernel.value(),
-            frame_stride=self.frame_stride.value(),
+            skip_frames=self.skip_frames.value(),
         )
+
+    def set_hyperparameter_controls_enabled(self, enabled: bool) -> None:
+        for widget in self.hyperparameter_controls:
+            widget.setEnabled(enabled)
 
     def current_sweep_config(self) -> SweepConfig:
         return SweepConfig(
+            prompts=parse_text_csv(self.sweep_prompts.text(), "target prompts"),
+            model_ids=[self.sweep_models.currentText()],
             scales=parse_float_csv(self.sweep_scales.text(), 0.05, 1.0, "scales"),
             thresholds=parse_float_csv(self.sweep_thresholds.text(), 0.01, 0.99, "thresholds"),
+            skip_frames=parse_int_csv(self.sweep_skip_frames.text(), 0, 30, "skip frames"),
         )
 
     @Slot()
@@ -1141,20 +1474,24 @@ class MainWindow(QMainWindow):
         frame_text = "all frames" if self.benchmark_frames.value() == 0 else f"{self.benchmark_frames.value()} frames"
         self.sweep_estimate.setText(
             f"{config.combination_count} combinations "
-            f"({len(config.scales)} scales x {len(config.thresholds)} thresholds), benchmark: {frame_text}"
+            f"({len(config.model_ids)} backends x {len(config.prompts)} prompts x "
+            f"{len(config.skip_frames)} skip values x {len(config.scales)} scales x "
+            f"{len(config.thresholds)} thresholds), benchmark: {frame_text}"
         )
 
     @Slot()
     def reset_hyperparameters(self) -> None:
-        self.backend.setCurrentText(DEFAULT_SETTINGS["backend"])
         self.prompt.setText(DEFAULT_SETTINGS["prompt"])
         self.mode.setCurrentText(DEFAULT_SETTINGS["mode"])
         self.threshold.setValue(DEFAULT_SETTINGS["threshold"])
         self.infer_scale.setCurrentText(DEFAULT_SETTINGS["infer_scale"])
+        self.sweep_prompts.setText(DEFAULT_SETTINGS["sweep_prompts"])
+        self.sweep_models.setCurrentText(DEFAULT_SETTINGS["sweep_models"])
         self.sweep_scales.setText(DEFAULT_SETTINGS["sweep_scales"])
         self.sweep_thresholds.setText(DEFAULT_SETTINGS["sweep_thresholds"])
+        self.sweep_skip_frames.setText(DEFAULT_SETTINGS["sweep_skip_frames"])
         self.blur_kernel.setValue(DEFAULT_SETTINGS["blur_kernel"])
-        self.frame_stride.setValue(DEFAULT_SETTINGS["frame_stride"])
+        self.skip_frames.setValue(DEFAULT_SETTINGS["skip_frames"])
         self.benchmark_frames.setValue(DEFAULT_SETTINGS["benchmark_frames"])
         self.update_sweep_estimate()
         self.push_settings()
@@ -1162,9 +1499,11 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def push_settings(self, *args) -> None:  # type: ignore[no-untyped-def]
+        settings = self.current_settings()
         if self.inference_worker is not None:
-            self.inference_worker.configure(self.current_settings())
-        self.schedule_processed_render()
+            self.inference_worker.configure(settings)
+        if self.mask_buffer is not None:
+            self.mask_buffer.set_visualization(settings.threshold, settings.mode, settings.blur_kernel)
 
     @Slot(int)
     def on_threshold_changed(self, value: int) -> None:
@@ -1174,24 +1513,36 @@ class MainWindow(QMainWindow):
     @Slot()
     def apply_model(self) -> None:
         if self.sweep_worker is not None and self.sweep_worker.isRunning():
-            QMessageBox.warning(self, "Sweep running", "Wait for the current sweep before switching models.")
+            QMessageBox.warning(self, "Sweep running", "Wait for the current sweep before switching backends.")
             return
         if self.benchmark_worker is not None and self.benchmark_worker.isRunning():
-            QMessageBox.warning(self, "Benchmark running", "Wait for the current benchmark before switching models.")
+            QMessageBox.warning(self, "Benchmark running", "Wait for the current benchmark before switching backends.")
             return
-        self.stop_worker()
+        if self.retiring_threads:
+            QMessageBox.warning(self, "Worker stopping", "Wait for the previous source to finish stopping.")
+            self.model_name.setCurrentText(self.segmenter.model_name)
+            self.update_current_backend_label()
+            return
+        requested_backend = self.model_name.currentText()
+        unavailable_message = backend_unavailable_message(requested_backend)
+        if unavailable_message is not None:
+            QMessageBox.warning(self, "Backend unavailable", unavailable_message)
+            self.model_name.setCurrentText(self.segmenter.model_name)
+            self.update_current_backend_label()
+            return
+        self.stop_worker(wait=True)
         try:
-            self.segmenter.set_model(self.model_name.currentText(), self.device_name.currentText())
-            self.segmenter.set_yolo_model(self.yolo_model_name.currentText())
+            self.segmenter.set_model(requested_backend, self.device_name.currentText())
         except Exception as exc:
-            QMessageBox.warning(self, "Model switch failed", str(exc))
+            QMessageBox.warning(self, "Backend switch failed", str(exc))
+            self.model_name.setCurrentText(self.segmenter.model_name)
+            self.update_current_backend_label()
             return
         self.set_status(
-            f"CLIPSeg set to {self.segmenter.model_name}; "
-            f"YOLO-World set to {self.segmenter.yolo_model_name}; "
-            f"device: {self.segmenter.device}. "
+            f"Backend set to {self.segmenter.model_name} on {self.segmenter.device}. "
             "It will load on the next inference."
         )
+        self.update_current_backend_label()
 
     @Slot()
     def browse_video(self) -> None:
@@ -1200,21 +1551,20 @@ class MainWindow(QMainWindow):
             self.video_path.setText(path)
 
     def start_source(self, source: int | str) -> None:
-        self.stop_worker()
+        self.stop_worker(wait=True)
         self.active_source = source
-        self.latest_display_frame = None
-        self.latest_mask_result = None
         self.frame_buffer = LatestFrameBuffer()
-        self.capture_worker = CaptureWorker(self.frame_buffer)
-        self.inference_worker = InferenceWorker(self.segmenter, self.frame_buffer)
+        self.mask_buffer = LatestMaskBuffer()
+        self.capture_worker = CaptureWorker(self.frame_buffer, self.mask_buffer)
+        self.inference_worker = InferenceWorker(self.segmenter, self.frame_buffer, self.mask_buffer)
         self.capture_worker.set_source(source)
         self.inference_worker.configure(self.current_settings())
-        self.capture_worker.display_frame.connect(self.update_live_frame)
+        self.capture_worker.input_frame.connect(self.input_pane.set_image)
+        self.capture_worker.output_frame.connect(self.output_pane.set_image)
         self.capture_worker.status.connect(self.set_status)
         self.capture_worker.video_info.connect(self.update_video_info)
         self.capture_worker.position_changed.connect(self.update_video_position)
         self.capture_worker.finished.connect(self.handle_capture_finished)
-        self.inference_worker.mask_result.connect(self.update_mask_result)
         self.inference_worker.metrics.connect(self.update_metrics)
         self.inference_worker.status.connect(self.set_status)
         self.capture_worker.start()
@@ -1284,80 +1634,64 @@ class MainWindow(QMainWindow):
         self.video_position.setText(f"{frame_index} / {max(0, total_frames - 1)}")
 
     @Slot()
-    def stop_worker(self) -> None:
+    def stop_worker(self, *, wait: bool = False) -> None:
         capture_worker = self.capture_worker
         inference_worker = self.inference_worker
-        if capture_worker is not None:
-            try:
-                capture_worker.finished.disconnect(self.handle_capture_finished)
-            except (RuntimeError, TypeError):
-                pass
+        self.capture_worker = None
+        self.inference_worker = None
+        self.active_source = None
+        self.frame_buffer = None
+        self.mask_buffer = None
+
         if capture_worker is not None:
             capture_worker.stop()
         if inference_worker is not None:
             inference_worker.stop()
-        if capture_worker is not None and capture_worker.isRunning():
-            capture_worker.wait()
-        if inference_worker is not None and inference_worker.isRunning():
-            inference_worker.wait()
-        self.capture_worker = None
-        self.inference_worker = None
-        self.active_source = None
-        self.frame_buffer = None
-        self.latest_display_frame = None
-        self.latest_mask_result = None
+        for worker in [capture_worker, inference_worker]:
+            if worker is None:
+                continue
+            if wait and worker.isRunning() and worker.wait(5000):
+                worker.deleteLater()
+            elif worker.isRunning():
+                self.retire_thread(worker)
+            else:
+                worker.deleteLater()
 
     @Slot()
     def handle_capture_finished(self) -> None:
-        if self.capture_worker is not None and self.sender() is not self.capture_worker:
+        capture_worker = self.sender()
+        if capture_worker is not self.capture_worker:
             return
         inference_worker = self.inference_worker
+        finished_source = self.active_source
+        self.capture_worker = None
+        self.inference_worker = None
+        self.active_source = None
+        self.frame_buffer = None
+        self.mask_buffer = None
         if inference_worker is not None:
             inference_worker.stop()
             if inference_worker.isRunning():
-                inference_worker.wait()
-        self.inference_worker = None
-        self.capture_worker = None
-        self.active_source = None
-        self.frame_buffer = None
+                self.retire_thread(inference_worker)
+            else:
+                inference_worker.deleteLater()
+        if isinstance(capture_worker, QThread):
+            capture_worker.deleteLater()
+        self.set_status("video finished" if isinstance(finished_source, str) else "capture stopped")
 
-    @Slot(object)
-    def update_live_frame(self, captured: CapturedFrame) -> None:
-        self.latest_display_frame = captured.frame
-        self.input_pane.set_image(bgr_to_qimage(captured.frame))
-        self.schedule_processed_render()
-
-    @Slot(object)
-    def update_mask_result(self, result: MaskResult) -> None:
-        self.latest_mask_result = result
-        self.schedule_processed_render()
-
-    def schedule_processed_render(self) -> None:
-        if self.processed_render_pending:
+    def retire_thread(self, thread: QThread) -> None:
+        if thread in self.retiring_threads:
             return
-        now = time.perf_counter()
-        min_interval = 1.0 / DISPLAY_FPS_LIMIT
-        delay_ms = max(0, round((min_interval - (now - self.last_processed_render_at)) * 1000.0))
-        self.processed_render_pending = True
-        QTimer.singleShot(delay_ms, self.render_processed_pane)
+        self.retiring_threads.append(thread)
+        thread.finished.connect(lambda thread=thread: self.release_retired_thread(thread))
+        if not thread.isRunning():
+            self.release_retired_thread(thread)
 
-    def render_processed_pane(self) -> None:
-        self.processed_render_pending = False
-        self.last_processed_render_at = time.perf_counter()
-        if self.latest_display_frame is None:
+    def release_retired_thread(self, thread: QThread) -> None:
+        if thread not in self.retiring_threads:
             return
-        settings = self.current_settings()
-        if self.latest_mask_result is None:
-            output = self.latest_display_frame
-        else:
-            output = apply_mask_overlay(
-                self.latest_display_frame,
-                self.latest_mask_result.mask,
-                settings.threshold,
-                settings.mode,
-                settings.blur_kernel,
-            )
-        self.output_pane.set_image(bgr_to_qimage(output))
+        self.retiring_threads.remove(thread)
+        thread.deleteLater()
 
     @Slot(object)
     def update_metrics(self, metrics: FrameMetrics) -> None:
@@ -1383,6 +1717,13 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "Invalid sweep space", str(exc))
             return
+        for backend_name in sweep_config.model_ids:
+            unavailable_message = backend_unavailable_message(backend_name)
+            if unavailable_message is not None:
+                QMessageBox.warning(self, "Backend unavailable", unavailable_message)
+                return
+        if any(model_id != self.segmenter.model_name for model_id in sweep_config.model_ids):
+            self.stop_worker(wait=True)
         self.sweep_button.setEnabled(False)
         self.save_sweep_button.setEnabled(False)
         self.latest_sweep_results = []
@@ -1399,6 +1740,9 @@ class MainWindow(QMainWindow):
         self.sweep_table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             values = [
+                str(row["model_id"]),
+                str(row["prompt"]),
+                str(row["skip_frames"]),
                 f'{row["infer_scale"]:.2f}',
                 f'{row["threshold"]:.2f}',
                 f'{row["latency_ms"]:.1f}',
@@ -1430,6 +1774,9 @@ class MainWindow(QMainWindow):
             output_path = output_path.with_suffix(".csv")
 
         fieldnames = [
+            "backend",
+            "prompt",
+            "skip_frames",
             "infer_scale",
             "threshold",
             "latency_ms",
@@ -1441,7 +1788,9 @@ class MainWindow(QMainWindow):
                 writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
                 writer.writeheader()
                 for row in self.latest_sweep_results:
-                    writer.writerow({field: row.get(field, "") for field in fieldnames})
+                    output_row = {field: row.get(field, "") for field in fieldnames}
+                    output_row["backend"] = row.get("model_id", "")
+                    writer.writerow(output_row)
         except Exception as exc:
             QMessageBox.warning(self, "Save failed", str(exc))
             return
@@ -1455,8 +1804,14 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "Invalid sweep space", str(exc))
             return
-        self.stop_worker()
+        for backend_name in sweep_config.model_ids:
+            unavailable_message = backend_unavailable_message(backend_name)
+            if unavailable_message is not None:
+                QMessageBox.warning(self, "Backend unavailable", unavailable_message)
+                return
+        self.stop_worker(wait=True)
         self.video_position.setText("benchmark")
+        self.set_hyperparameter_controls_enabled(False)
         self.benchmark_button.setEnabled(False)
         self.save_benchmark_button.setEnabled(False)
         self.latest_benchmark_results = []
@@ -1475,8 +1830,14 @@ class MainWindow(QMainWindow):
         self.benchmark_worker.preview.connect(self.update_benchmark_preview)
         self.benchmark_worker.finished_with_results.connect(self.populate_benchmark)
         self.benchmark_worker.status.connect(self.set_status)
-        self.benchmark_worker.finished.connect(lambda: self.benchmark_button.setEnabled(True))
+        self.benchmark_worker.finished.connect(self.finish_benchmark_run)
         self.benchmark_worker.start()
+
+    @Slot()
+    def finish_benchmark_run(self) -> None:
+        self.set_hyperparameter_controls_enabled(True)
+        self.benchmark_button.setEnabled(True)
+        self.save_benchmark_button.setEnabled(bool(self.latest_benchmark_results))
 
     @Slot(list)
     def populate_benchmark(self, rows: list[dict]) -> None:
@@ -1507,12 +1868,17 @@ class MainWindow(QMainWindow):
             output_path = output_path.with_suffix(".csv")
 
         fieldnames = [
+            "backend",
+            "prompt",
+            "skip_frames",
             "infer_scale",
             "threshold",
             "non_target_leakage",
             "target_damage",
             "fps",
             "latency_ms",
+            "model_latency_ms",
+            "model_calls",
             "tp",
             "fp",
             "tn",
@@ -1523,7 +1889,9 @@ class MainWindow(QMainWindow):
                 writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
                 writer.writeheader()
                 for row in self.latest_benchmark_results:
-                    writer.writerow({field: row.get(field, "") for field in fieldnames})
+                    output_row = {field: row.get(field, "") for field in fieldnames}
+                    output_row["backend"] = row.get("model_id", "")
+                    writer.writerow(output_row)
         except Exception as exc:
             QMessageBox.warning(self, "Save failed", str(exc))
             return
@@ -1535,6 +1903,9 @@ class MainWindow(QMainWindow):
         row_index = self.benchmark_table.rowCount()
         self.benchmark_table.insertRow(row_index)
         values = [
+            str(row["model_id"]),
+            str(row["prompt"]),
+            str(row["skip_frames"]),
             f'{row["infer_scale"]:.2f}',
             f'{row["threshold"]:.2f}',
             f'{row["non_target_leakage"]:.4f}',
@@ -1551,7 +1922,10 @@ class MainWindow(QMainWindow):
     def update_benchmark_progress(self, current: int, total: int, label: str) -> None:
         self.benchmark_progress.setRange(0, total)
         self.benchmark_progress.setValue(current - 1)
-        self.benchmark_progress_label.setText(f"running {current}/{total}: {label}")
+        compact_label = label
+        if len(compact_label) > 96:
+            compact_label = f"{compact_label[:93]}..."
+        self.benchmark_progress_label.setText(f"running {current}/{total}\n{compact_label}")
 
     @Slot(QImage, QImage)
     def update_benchmark_preview(self, input_image: QImage, output_image: QImage) -> None:
@@ -1559,18 +1933,21 @@ class MainWindow(QMainWindow):
         self.output_pane.set_image(output_image)
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        self.stop_worker()
+        self.stop_worker(wait=True)
+        for thread in list(self.retiring_threads):
+            if thread.isRunning():
+                thread.wait()
+            self.release_retired_thread(thread)
         for thread in [self.sweep_worker, self.benchmark_worker]:
-            if thread is not None:
-                thread.stop()
-                if thread.isRunning():
-                    thread.wait()
+            if thread is not None and thread.isRunning():
+                thread.wait()
+        self.segmenter.close()
         event.accept()
 
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PySide6 real-time prompt segmentation MVP.")
-    parser.add_argument("--model", default=MODEL_NAME)
+    parser.add_argument("--backend", default=BACKEND_CLIPSEG, choices=BACKEND_PRESETS)
     parser.add_argument("--device", default=default_device())
     return parser.parse_args(list(argv))
 
@@ -1578,7 +1955,7 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
 def main(argv: Iterable[str] = sys.argv[1:]) -> int:
     args = parse_args(argv)
     app = QApplication(sys.argv)
-    segmenter = PromptSegmenter(args.model, args.device)
+    segmenter = PromptSegmenter(args.backend, args.device)
     window = MainWindow(segmenter)
     window.show()
     return app.exec()
